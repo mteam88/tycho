@@ -11,7 +11,7 @@ use crate::encoding::{
             UNISWAP_V2_FORKS, UNISWAP_V3_FORKS,
         },
         swap_encoder::{
-            aerodrome_v1::AerodromeV1SwapEncoder, balancer_v2::BalancerV2SwapEncoder,
+            aerodrome_v1::AerodromeV1SwapEncoder, baibai::BaibaiSwapEncoder, balancer_v2::BalancerV2SwapEncoder,
             balancer_v3::BalancerV3SwapEncoder, bebop::BebopSwapEncoder, bopamm::BopAMMSwapEncoder,
             curve::CurveSwapEncoder, ekubo::EkuboSwapEncoder, ekubo_v3::EkuboV3SwapEncoder,
             erc_4626::ERC4626SwapEncoder, etherfi::EtherfiSwapEncoder,
@@ -203,6 +203,7 @@ impl SwapEncoderRegistry {
             "rocketpool" => {
                 Ok(Box::new(RocketpoolSwapEncoder::new(executor_address, self.chain, config)?))
             }
+            "baibai" => Ok(Box::new(BaibaiSwapEncoder::new(executor_address, self.chain, config)?)),
             "sky" => Ok(Box::new(SkySwapEncoder::new(executor_address, self.chain, config)?)),
             "erc4626" => {
                 Ok(Box::new(ERC4626SwapEncoder::new(executor_address, self.chain, config)?))
