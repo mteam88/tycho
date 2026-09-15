@@ -47,6 +47,12 @@ fn state(fixture: &Fixture, scenario: &Scenario) -> BaibaiState {
         balances: [U256::from(10).pow(U256::from(24)); 2],
         c_unit: U256::from(1),
         timestamp: fixture.timestamp,
+        fee_attributes: [
+            format!("pair_fee_{}", hex::encode([1; 20])),
+            format!("router_fee_{}", hex::encode([1; 20])),
+        ],
+        fees: [None; 2],
+        default_fee: 0,
     }
 }
 
@@ -216,6 +222,7 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
                 .iter()
                 .enumerate()
                 .map(|(i, word)| (format!("word_{i}"), Bytes::from(word.to_be_bytes::<32>())))
+                .chain([(String::from("default_fee_bps"), Bytes::from([0u8; 32]))])
                 .collect(),
             balances: expected
                 .tokens
@@ -236,7 +243,7 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
         header.clone(),
         &HashMap::new(),
         &all_tokens,
-        &DecoderContext::new(),
+        &DecoderContext::new().caller(Bytes::from([1u8; 20])),
     )
     .await
     .unwrap();
@@ -251,7 +258,7 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
         header,
         &HashMap::new(),
         &all_tokens,
-        &DecoderContext::new()
+        &DecoderContext::new().caller(Bytes::from([1u8; 20]))
     )
     .await
     .is_err());
@@ -334,6 +341,122 @@ fn bid_limits_bound_rounded_proceeds_within_each_segment() {
                     );
                 }
                 assert_eq!(output, big(side.quote(U256::from(limit)).unwrap().0));
+            }
+        }
+    }
+}
+
+#[test]
+fn fees_follow_override_precedence_and_updates_are_atomic() {
+    let fixture = fixture();
+    let mut state = state(&fixture, &fixture.scenarios[0]);
+    let mut update = |attrs: Vec<(String, Bytes)>, expected: f64| {
+        state
+            .delta_transition(
+                ProtocolStateDelta {
+                    component_id: state.id.clone(),
+                    updated_attributes: attrs.into_iter().collect(),
+                    deleted_attributes: Default::default(),
+                },
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+        assert_eq!(state.fee(), expected);
+    };
+    let pair = format!("pair_fee_{}", hex::encode([1; 20]));
+    let router = format!("router_fee_{}", hex::encode([1; 20]));
+    update(vec![("default_fee_bps".into(), Bytes::from([0, 25]))], 0.0025);
+    update(vec![(router.clone(), Bytes::from([1, 0, 10]))], 0.001);
+    update(vec![(pair.clone(), Bytes::from([1, 0, 0]))], 0.0);
+    update(vec![("default_fee_bps".into(), Bytes::from([0, 50]))], 0.0);
+    update(vec![(pair, Bytes::from([0, 0, 0]))], 0.001);
+    update(vec![(router, Bytes::from([0, 0, 0]))], 0.005);
+    update(vec![(format!("pair_fee_{}", hex::encode([2; 20])), Bytes::from([1, 3, 232]))], 0.005);
+    let before = state.clone();
+    assert!(state
+        .delta_transition(
+            ProtocolStateDelta {
+                component_id: state.id.clone(),
+                updated_attributes: HashMap::from([(
+                    "default_fee_bps".into(),
+                    Bytes::from([3, 233])
+                )]),
+                deleted_attributes: Default::default(),
+            },
+            &HashMap::new(),
+            &Balances::default()
+        )
+        .is_err());
+    assert_eq!(state, before);
+}
+
+#[test]
+fn fees_round_up_retain_custody_and_limits_bound_net_output() {
+    let fixture = fixture();
+    for scenario in fixture.scenarios.iter().take(5) {
+        let gross = state(&fixture, scenario);
+        let tokens = tokens(&gross);
+        for bps in [1u16, 25, 1000] {
+            let mut net = gross.clone();
+            net.default_fee = bps;
+            for case in &scenario.cases {
+                let input = BigUint::from_str(&case.input).unwrap();
+                let expected =
+                    BigUint::from_str(&case.output).unwrap() * (10_000 - bps) / 10_000u16;
+                let direction = usize::from(!case.sell_base);
+                let result =
+                    net.get_amount_out(input.clone(), &tokens[direction], &tokens[1 - direction]);
+                if expected == BigUint::ZERO {
+                    assert!(result.is_err());
+                    continue;
+                }
+                let result = result.unwrap();
+                assert_eq!(result.amount, expected);
+                let next = result
+                    .new_state
+                    .as_any()
+                    .downcast_ref::<BaibaiState>()
+                    .unwrap();
+                let gross_result = gross
+                    .get_amount_out(input.clone(), &tokens[direction], &tokens[1 - direction])
+                    .unwrap();
+                let gross_next = gross_result
+                    .new_state
+                    .as_any()
+                    .downcast_ref::<BaibaiState>()
+                    .unwrap();
+                assert_eq!(next.words, gross_next.words);
+                assert_eq!(
+                    big(next.balances[1 - direction]),
+                    big(net.balances[1 - direction]) - &expected
+                );
+                // Only net output must fit custody, even when the curve's gross output does not.
+                let mut limited = net.clone();
+                limited.balances[1 - direction] = super::math::uint(&expected).unwrap();
+                assert_eq!(
+                    limited
+                        .get_amount_out(input, &tokens[direction], &tokens[1 - direction])
+                        .unwrap()
+                        .amount,
+                    expected
+                );
+                let (limit, output) = limited
+                    .get_limits(
+                        tokens[direction].address.clone(),
+                        tokens[1 - direction].address.clone(),
+                    )
+                    .unwrap();
+                assert!(output <= expected);
+                if limit != BigUint::ZERO {
+                    assert_eq!(
+                        limited
+                            .get_amount_out(limit, &tokens[direction], &tokens[1 - direction])
+                            .unwrap()
+                            .amount,
+                        output
+                    );
+                }
             }
         }
     }

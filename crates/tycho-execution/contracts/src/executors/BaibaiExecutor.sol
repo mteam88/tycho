@@ -6,10 +6,6 @@ import {TransferManager} from "../TransferManager.sol";
 
 interface IBaibaiEntrypoint {
     function quoteToken() external view returns (address);
-    function takerFeeBps(address taker, address base)
-        external
-        view
-        returns (uint16);
     function swapExactAmountIn(
         address base,
         address tokenIn,
@@ -22,8 +18,7 @@ interface IBaibaiEntrypoint {
 /// @notice Executes exact-input swaps through one BaiBai entrypoint.
 /// @dev Data is base (20 bytes) followed by sellBase (one byte, 0 or 1).
 contract BaibaiExecutor is IExecutor {
-    error InvalidData();
-    error NonzeroTakerFee();
+    error BaibaiExecutor__InvalidData();
 
     IBaibaiEntrypoint public immutable entrypoint;
     address public immutable quoteToken;
@@ -32,7 +27,7 @@ contract BaibaiExecutor is IExecutor {
     constructor(address entrypoint_) {
         entrypoint = IBaibaiEntrypoint(entrypoint_);
         quoteToken = entrypoint.quoteToken();
-        if (quoteToken == address(0)) revert InvalidData();
+        if (quoteToken == address(0)) revert BaibaiExecutor__InvalidData();
     }
 
     /// @inheritdoc IExecutor
@@ -45,16 +40,15 @@ contract BaibaiExecutor is IExecutor {
     }
 
     /// @inheritdoc IExecutor
+    // IExecutor is payable for delegatecall from the router; BaiBai swaps use ERC20s.
+    // slither-disable-next-line locked-ether
     function swap(uint256 amountIn, bytes calldata data, address receiver)
         external
         payable
     {
         (address base, address tokenIn,) = _decode(data);
-        // The native simulator quotes the zero-fee path. Under delegatecall,
-        // address(this) is the router, which is also the entrypoint's fee identity.
-        if (entrypoint.takerFeeBps(address(this), base) != 0) {
-            revert NonzeroTakerFee();
-        }
+        // The router enforces minAmountOut using the actual output balance delta.
+        // slither-disable-next-line unused-return
         entrypoint.swapExactAmountIn(base, tokenIn, amountIn, 0, receiver);
     }
 
@@ -86,9 +80,13 @@ contract BaibaiExecutor is IExecutor {
         view
         returns (address base, address tokenIn, address tokenOut)
     {
-        if (data.length != 21 || uint8(data[20]) > 1) revert InvalidData();
+        if (data.length != 21 || uint8(data[20]) > 1) {
+            revert BaibaiExecutor__InvalidData();
+        }
         base = address(bytes20(data[:20]));
-        if (base == address(0) || base == quoteToken) revert InvalidData();
+        if (base == address(0) || base == quoteToken) {
+            revert BaibaiExecutor__InvalidData();
+        }
         bool sellBase = data[20] == bytes1(uint8(1));
         return
             (base, sellBase ? base : quoteToken, sellBase ? quoteToken : base);
