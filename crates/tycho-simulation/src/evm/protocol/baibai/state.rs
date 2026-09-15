@@ -26,9 +26,27 @@ pub struct BaibaiState {
     pub(super) balances: [U256; 2],
     pub(super) c_unit: U256,
     pub(super) timestamp: u64,
+    pub(super) fee_attributes: [String; 2],
+    pub(super) fees: [Option<u16>; 2],
+    pub(super) default_fee: u16,
 }
 
 impl BaibaiState {
+    fn fee_bps(&self) -> u16 {
+        self.fees[0]
+            .or(self.fees[1])
+            .unwrap_or(self.default_fee)
+    }
+
+    fn after_fee(&self, output: U256) -> Result<U256, SimulationError> {
+        // floor(gross * (1 - fee)) equals gross minus the contract's rounded-up fee.
+        crate::evm::protocol::utils::solidity_math::mul_div(
+            output,
+            U256::from(10_000 - self.fee_bps()),
+            U256::from(10_000),
+        )
+    }
+
     pub(super) fn fresh(&self) -> bool {
         let last: u64 = self.words[1].as_limbs()[2];
         let valid: u64 = self.words[1].as_limbs()[3];
@@ -102,7 +120,7 @@ impl BaibaiState {
 #[typetag::serde]
 impl ProtocolSim for BaibaiState {
     fn fee(&self) -> f64 {
-        0.0
+        f64::from(self.fee_bps()) / 10_000.0
     }
 
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
@@ -113,7 +131,8 @@ impl ProtocolSim for BaibaiState {
         Ok(self
             .side(direction == 1)?
             .marginal_price()? *
-            10f64.powi(base.decimals as i32 - quote.decimals as i32))
+            10f64.powi(base.decimals as i32 - quote.decimals as i32) *
+            (1.0 - self.fee()))
     }
 
     fn get_amount_out(
@@ -130,6 +149,7 @@ impl ProtocolSim for BaibaiState {
         let (output, cursor) = self
             .side(direction == 1)?
             .quote(input)?;
+        let output = self.after_fee(output)?;
         if output == U256::ZERO && input != U256::ZERO {
             return Err(invalid("input below atomic precision"));
         }
@@ -161,23 +181,23 @@ impl ProtocolSim for BaibaiState {
             return Ok((BigUint::ZERO, BigUint::ZERO));
         }
         high = high.min(U256::MAX - self.balances[direction]);
-        let full_output = side.quote(high)?.0;
+        let full_output = self.after_fee(side.quote(high)?.0)?;
         if full_output == U256::ZERO {
             return Ok((BigUint::ZERO, BigUint::ZERO));
         }
-        if side.output_bound(high)? <= available {
+        if self.after_fee(side.output_bound(high)?)? <= available {
             return Ok((big(high), big(full_output)));
         }
         // Capacity is bounded by curve depth and the custodian's unreserved output balance.
         while low < high {
             let mid = low + (high - low) / U256::from(2) + (high - low) % U256::from(2);
-            if side.output_bound(mid)? <= available {
+            if self.after_fee(side.output_bound(mid)?)? <= available {
                 low = mid;
             } else {
                 high = mid - U256::from(1);
             }
         }
-        let output = side.quote(low)?.0;
+        let output = self.after_fee(side.quote(low)?.0)?;
         if output == U256::ZERO {
             return Ok((BigUint::ZERO, BigUint::ZERO));
         }
@@ -195,6 +215,8 @@ impl ProtocolSim for BaibaiState {
             return Err(TransitionError::DecodeError("BaiBai state words cannot be deleted".into()));
         }
         super::decoder::apply_words(&mut next.words, &delta.updated_attributes, false)
+            .map_err(|e| TransitionError::DecodeError(e.to_string()))?;
+        super::decoder::apply_fees(&mut next, &delta.updated_attributes)
             .map_err(|e| TransitionError::DecodeError(e.to_string()))?;
         if let Some(updated) = balances
             .component_balances
