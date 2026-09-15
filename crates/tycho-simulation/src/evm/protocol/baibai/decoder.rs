@@ -41,7 +41,7 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
         block: BlockHeader,
         _account_balances: &HashMap<Bytes, HashMap<Bytes, Bytes>>,
         all_tokens: &HashMap<Bytes, Token>,
-        _context: &DecoderContext,
+        context: &DecoderContext,
     ) -> Result<Self, Self::Error> {
         let base = snapshot
             .component
@@ -83,6 +83,16 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
             .ok_or_else(|| {
                 InvalidSnapshotError::ValueError("quote decimals exceed uint256".into())
             })?;
+        let caller = context
+            .caller
+            .as_ref()
+            .filter(|caller| caller.len() == 20)
+            .ok_or_else(|| {
+                InvalidSnapshotError::ValueError(
+                    "BaiBai requires DecoderContext::caller with the execution router address"
+                        .into(),
+                )
+            })?;
         let mut state = Self {
             id: snapshot.component.id.clone(),
             tokens: [base, quote],
@@ -90,8 +100,22 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
             balances: [U256::ZERO; 2],
             c_unit,
             timestamp: block.timestamp,
+            fee_attributes: [
+                format!("pair_fee_{}", hex::encode(caller)),
+                format!("router_fee_{}", hex::encode(caller)),
+            ],
+            fees: [None; 2],
+            default_fee: 0,
         };
         apply_words(&mut state.words, &snapshot.state.attributes, true)?;
+        if !snapshot
+            .state
+            .attributes
+            .contains_key("default_fee_bps")
+        {
+            return Err(InvalidSnapshotError::MissingAttribute("default_fee_bps".into()));
+        }
+        apply_fees(&mut state, &snapshot.state.attributes)?;
         for (i, token) in state.tokens.iter().enumerate() {
             state.balances[i] = word(
                 snapshot
@@ -109,4 +133,36 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
             .map_err(|e| InvalidSnapshotError::ValueError(e.to_string()))?;
         Ok(state)
     }
+}
+
+/// Decode only this caller's overrides; other callers never enlarge the simulation state.
+pub(super) fn apply_fees(
+    state: &mut BaibaiState,
+    attrs: &HashMap<String, Bytes>,
+) -> Result<(), InvalidSnapshotError> {
+    let invalid = || InvalidSnapshotError::ValueError("invalid BaiBai fee attribute".into());
+    if let Some(value) = attrs.get("default_fee_bps") {
+        let value = word(value)? & U256::from(u16::MAX);
+        if value > U256::from(1000) {
+            return Err(invalid());
+        }
+        state.default_fee = value.to::<u16>();
+    }
+    for (name, fee) in state
+        .fee_attributes
+        .iter()
+        .zip(state.fees.iter_mut())
+    {
+        if let Some(value) = attrs.get(name) {
+            if value.len() != 3 || value[0] > 1 {
+                return Err(invalid());
+            }
+            let bps = u16::from_be_bytes([value[1], value[2]]);
+            if bps > 1000 || (value[0] == 0 && bps != 0) {
+                return Err(invalid());
+            }
+            *fee = (value[0] == 1).then_some(bps);
+        }
+    }
+    Ok(())
 }

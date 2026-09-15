@@ -29,6 +29,10 @@ impl Config {
         Ok(config)
     }
 
+    pub fn default_fee_slot(&self) -> B256 {
+        B256::from(namespace("baibai.storage.Entrypoint") + U256::from(1))
+    }
+
     pub fn id(&self) -> String {
         format!("0x{:x}{:x}", self.entrypoint, self.base)
     }
