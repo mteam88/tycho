@@ -36,17 +36,12 @@ impl TychoRunner {
         &self,
         spkg_path: &str,
         start_block: u64,
-        end_block: &alloy::rpc::types::Block,
+        end_block: u64,
         protocol_type_names: &[String],
         protocol_system: &str,
         module_name: Option<String>,
     ) -> miette::Result<()> {
-        let end_number = end_block.header.number;
-        let retention_horizon =
-            chrono::DateTime::from_timestamp(end_block.header.timestamp as i64, 0)
-                .ok_or_else(|| miette::miette!("Invalid stop block timestamp"))?
-                .naive_utc();
-        info!("Running Tycho indexer from block {start_block} to {end_number}...");
+        info!("Running Tycho indexer from block {start_block} to {end_block}...");
 
         let mut cmd = Command::new("tycho-indexer");
         cmd.env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or("tycho_indexer=info".to_string()))
@@ -79,13 +74,9 @@ impl TychoRunner {
             "--start-block",
             &start_block.to_string(),
             "--stop-block",
-            // Advance beyond the tested block to flush the indexer's pending deltas.
-            &(end_number + 3).to_string(),
-            // The extra flush blocks must not discard the snapshot being tested.
-            "--retention-horizon",
-            &retention_horizon
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string(),
+            &(end_block + 3).to_string(), /* +3 is to force our the stop block to be indexed and
+                                           * saved into the db. stop block +1 and +2 will not be
+                                           * included in the db */
             "--dci-plugin",
             "rpc",
         ]);
