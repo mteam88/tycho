@@ -5,10 +5,10 @@ use anyhow::Result;
 use config::Config;
 use std::collections::{BTreeMap, HashMap};
 use substreams::{pb::substreams::StoreDeltas, prelude::*};
-use substreams_ethereum::{pb::eth, Event};
+use substreams_ethereum::pb::eth;
 use tycho_substreams::{
-    abi::erc20::{events::Transfer, functions::BalanceOf},
-    balances::{aggregate_balances_changes, store_balance_changes},
+    abi::erc20::functions::BalanceOf,
+    balances::{aggregate_balances_changes, extract_balance_deltas_from_tx, store_balance_changes},
     prelude::*,
 };
 
@@ -54,32 +54,15 @@ fn relative_balances(config: &Config, block: &eth::v2::Block) -> Result<BlockBal
                 component_id: config.id().into_bytes(),
             });
         }
-    } else if block.number > config.start_block {
-        for view in block.logs() {
-            let log = view.log;
-            if log.address != config.base.as_slice() && log.address != config.quote.as_slice() {
-                continue;
+    } else {
+        for tx in block.transactions() {
+            for mut delta in extract_balance_deltas_from_tx(tx, |token, owner| {
+                owner == config.custodian.as_slice() &&
+                    (token == config.base.as_slice() || token == config.quote.as_slice())
+            }) {
+                delta.component_id = config.id().into_bytes();
+                balance_deltas.push(delta);
             }
-            let Some(transfer) = Transfer::match_and_decode(log) else {
-                continue;
-            };
-            if transfer.from == transfer.to {
-                continue;
-            }
-            let value = if transfer.to == config.custodian.as_slice() {
-                transfer.value
-            } else if transfer.from == config.custodian.as_slice() {
-                transfer.value.neg()
-            } else {
-                continue;
-            };
-            balance_deltas.push(BalanceDelta {
-                ord: log.ordinal,
-                tx: Some(view.receipt.transaction.into()),
-                token: log.address.clone(),
-                delta: value.to_signed_bytes_be(),
-                component_id: config.id().into_bytes(),
-            });
         }
     }
     balance_deltas.sort_unstable_by_key(|delta| delta.ord);
@@ -114,24 +97,21 @@ pub fn map_protocol_changes(
             // start_block is the entrypoint's deployment block, before CurveBook v3
             // and custody storage exist. Subsequent writes replace these zero words.
             let mut attributes: Vec<_> = (0..32)
-                .map(|i| attribute(&format!("word_{i}"), vec![0; 32]))
+                .map(|i| creation_attribute(&format!("word_{i}"), vec![0; 32]))
                 .collect();
-            attributes.push(attribute("balance_owner", config.custodian.to_vec()));
+            attributes.push(creation_attribute("balance_owner", config.custodian.to_vec()));
+            attributes.push(creation_attribute("default_fee_bps", vec![0; 32]));
             builder.add_entity_change(&EntityChanges { component_id: component.id, attributes });
         }
     }
-    if block.number >= config.start_block {
-        for tx in block.transactions() {
-            let attrs = storage_attributes(tx, &slots);
-            if !attrs.is_empty() {
-                changes
-                    .entry(tx.index.into())
-                    .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
-                    .add_entity_change(&EntityChanges {
-                        component_id: config.id(),
-                        attributes: attrs,
-                    });
-            }
+    for tx in block.transactions() {
+        let mut attrs = storage_attributes(&config, tx, &slots);
+        attrs.extend(fee_attributes(&config, tx)?);
+        if !attrs.is_empty() {
+            changes
+                .entry(tx.index.into())
+                .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
+                .add_entity_change(&EntityChanges { component_id: config.id(), attributes: attrs });
         }
     }
     for (_, (tx, balances)) in aggregate_balances_changes(balances, deltas) {
@@ -156,6 +136,7 @@ pub fn map_protocol_changes(
 
 /// Calls are nested trace order; their writes must be ordered by execution ordinal.
 fn storage_attributes(
+    config: &Config,
     tx: &eth::v2::TransactionTrace,
     slots: &[(alloy_primitives::Address, alloy_primitives::B256)],
 ) -> Vec<Attribute> {
@@ -166,6 +147,11 @@ fn storage_attributes(
         .filter(|call| !call.state_reverted)
     {
         for write in &call.storage_changes {
+            if write.address != config.curve_book.as_slice() &&
+                write.address != config.custodian.as_slice()
+            {
+                continue;
+            }
             if let Some(index) = slots
                 .iter()
                 .position(|(address, slot)| {
@@ -185,6 +171,85 @@ fn storage_attributes(
         .collect();
     attrs.sort_by(|a, b| a.name.cmp(&b.name));
     attrs
+}
+
+/// Fee events are emitted by the proxy, including during delegatecall. Only the final
+/// value per transaction matters; clearing an override retains an explicit unconfigured value.
+fn fee_attributes(config: &Config, tx: &eth::v2::TransactionTrace) -> Result<Vec<Attribute>> {
+    use alloy_primitives::{keccak256, Address, U256};
+    if !tx
+        .calls
+        .iter()
+        .any(|call| !call.state_reverted && call.address == config.entrypoint.as_slice())
+    {
+        return Ok(vec![]);
+    }
+    let set = keccak256("TakerFeeSet(address,address,uint16)");
+    let clear = keccak256("TakerFeeCleared(address,address)");
+    let mut latest = BTreeMap::new();
+    for (log, _) in tx
+        .logs_with_calls()
+        .filter(|(log, _)| log.address == config.entrypoint.as_slice())
+    {
+        let Some(topic) = log.topics.first() else { continue };
+        if topic != set.as_slice() && topic != clear.as_slice() {
+            continue;
+        }
+        anyhow::ensure!(
+            log.topics.len() == 3 && log.topics[1].len() == 32 && log.topics[2].len() == 32,
+            "invalid BaiBai fee event topics"
+        );
+        let base = Address::from_slice(&log.topics[2][12..]);
+        if base != config.base && !base.is_zero() {
+            continue;
+        }
+        let configured = topic == set.as_slice();
+        anyhow::ensure!(!configured || log.data.len() == 32, "invalid BaiBai fee event data");
+        let bps = if configured { U256::from_be_slice(&log.data) } else { U256::ZERO };
+        anyhow::ensure!(bps <= U256::from(1000), "invalid BaiBai fee");
+        let name = format!(
+            "{}_fee_{:x}",
+            if base.is_zero() { "router" } else { "pair" },
+            Address::from_slice(&log.topics[1][12..])
+        );
+        let value = vec![u8::from(configured), (bps.to::<u16>() >> 8) as u8, bps.to::<u16>() as u8];
+        let entry = latest
+            .entry(name)
+            .or_insert((0, vec![]));
+        if log.ordinal >= entry.0 {
+            *entry = (log.ordinal, value);
+        }
+    }
+    // The default-fee slot is zero on the current implementation.
+    let slot = config.default_fee_slot();
+    let mut default = None;
+    for call in tx
+        .calls
+        .iter()
+        .filter(|call| !call.state_reverted)
+    {
+        for write in &call.storage_changes {
+            if write.address == config.entrypoint.as_slice() &&
+                write.key == slot.as_slice() &&
+                default
+                    .map_or(true, |last: &eth::v2::StorageChange| write.ordinal > last.ordinal)
+            {
+                default = Some(write);
+            }
+        }
+    }
+    let mut attrs: Vec<_> = latest
+        .into_iter()
+        .map(|(name, (_, value))| attribute(&name, value))
+        .collect();
+    if let Some(write) = default {
+        attrs.push(attribute("default_fee_bps", write.new_value.clone()));
+    }
+    Ok(attrs)
+}
+
+fn creation_attribute(name: &str, value: Vec<u8>) -> Attribute {
+    Attribute { name: name.into(), value, change: ChangeType::Creation.into() }
 }
 
 fn attribute(name: &str, value: Vec<u8>) -> Attribute {
@@ -241,7 +306,7 @@ mod tests {
     #[test]
     fn tracks_custody_transfers_in_ordinal_order_without_counting_self_transfers() {
         use alloy_primitives::{keccak256, Address, U256};
-        use eth::v2::{Block, Log, TransactionReceipt};
+        use eth::v2::{Block, Log};
         let config = Config::parse(PARAMS).unwrap();
         let outside = Address::repeat_byte(1);
         let log = |from: Address, to: Address, amount: u64, ordinal| Log {
@@ -259,14 +324,14 @@ mod tests {
         };
         let tx = TransactionTrace {
             status: 1,
-            receipt: Some(TransactionReceipt {
+            calls: vec![Call {
                 logs: vec![
                     log(outside, config.custodian, 7, 2),
                     log(config.custodian, outside, 5, 1),
                     log(config.custodian, config.custodian, 100, 3),
                 ],
                 ..Default::default()
-            }),
+            }],
             ..Default::default()
         };
         let block = Block {
@@ -277,11 +342,135 @@ mod tests {
         let deltas = relative_balances(&config, &block)
             .unwrap()
             .balance_deltas;
-        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas.len(), 4);
         assert_eq!(deltas[0].ord, 1);
         assert_eq!(BigInt::from_signed_bytes_be(&deltas[0].delta), BigInt::from(-5));
+        assert_eq!(
+            BigInt::from_signed_bytes_be(&deltas[2].delta) +
+                BigInt::from_signed_bytes_be(&deltas[3].delta),
+            BigInt::zero()
+        );
         assert_eq!(deltas[1].ord, 2);
         assert_eq!(BigInt::from_signed_bytes_be(&deltas[1].delta), BigInt::from(7));
+    }
+
+    #[test]
+    fn weth_wraps_and_unwraps_change_custody_balance() {
+        use alloy_primitives::{keccak256, U256};
+        use eth::v2::{Block, Log};
+        let config = Config::parse(PARAMS).unwrap();
+        let log = |event: &str, amount: u64, ordinal| Log {
+            address: config.base.to_vec(),
+            topics: vec![keccak256(event).to_vec(), config.custodian.into_word().to_vec()],
+            data: U256::from(amount)
+                .to_be_bytes::<32>()
+                .to_vec(),
+            ordinal,
+            ..Default::default()
+        };
+        let block = Block {
+            number: config.start_block + 1,
+            transaction_traces: vec![TransactionTrace {
+                status: 1,
+                calls: vec![
+                    Call {
+                        logs: vec![
+                            log("Deposit(address,uint256)", 9, 1),
+                            log("Withdrawal(address,uint256)", 4, 2),
+                        ],
+                        ..Default::default()
+                    },
+                    Call {
+                        logs: vec![log("Deposit(address,uint256)", 100, 3)],
+                        state_reverted: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let deltas = relative_balances(&config, &block)
+            .unwrap()
+            .balance_deltas;
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(BigInt::from_signed_bytes_be(&deltas[0].delta), BigInt::from(9));
+        assert_eq!(BigInt::from_signed_bytes_be(&deltas[1].delta), BigInt::from(-4));
+        assert!(deltas
+            .iter()
+            .all(|delta| delta.component_id == config.id().as_bytes()));
+    }
+
+    #[test]
+    fn fee_events_keep_explicit_zero_clear_and_final_default_in_execution_order() {
+        use alloy_primitives::{keccak256, Address, U256};
+        use eth::v2::Log;
+        let config = Config::parse(PARAMS).unwrap();
+        let router = Address::repeat_byte(1);
+        let log = |base: Address, bps: Option<u16>, ordinal| Log {
+            address: config.entrypoint.to_vec(),
+            topics: vec![
+                keccak256(if bps.is_some() {
+                    "TakerFeeSet(address,address,uint16)"
+                } else {
+                    "TakerFeeCleared(address,address)"
+                })
+                .to_vec(),
+                router.into_word().to_vec(),
+                base.into_word().to_vec(),
+            ],
+            data: bps.map_or(vec![], |value| {
+                U256::from(value)
+                    .to_be_bytes::<32>()
+                    .to_vec()
+            }),
+            ordinal,
+            ..Default::default()
+        };
+        let write = |value, ordinal| StorageChange {
+            address: config.entrypoint.to_vec(),
+            key: config.default_fee_slot().to_vec(),
+            new_value: vec![value],
+            ordinal,
+            ..Default::default()
+        };
+        let tx = TransactionTrace {
+            calls: vec![
+                Call {
+                    address: config.entrypoint.to_vec(),
+                    logs: vec![log(config.base, Some(0), 20), log(Address::ZERO, None, 30)],
+                    storage_changes: vec![write(25, 25)],
+                    ..Default::default()
+                },
+                Call {
+                    address: config.entrypoint.to_vec(),
+                    logs: vec![
+                        log(config.base, Some(10), 10),
+                        log(Address::ZERO, Some(20), 15),
+                        log(Address::repeat_byte(2), Some(100), 16),
+                    ],
+                    storage_changes: vec![write(50, 5)],
+                    ..Default::default()
+                },
+                Call {
+                    address: config.entrypoint.to_vec(),
+                    logs: vec![log(config.base, Some(100), 40)],
+                    storage_changes: vec![write(100, 45)],
+                    state_reverted: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let attrs: HashMap<_, _> = fee_attributes(&config, &tx)
+            .unwrap()
+            .into_iter()
+            .map(|attr| (attr.name, attr.value))
+            .collect();
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs[&format!("pair_fee_{router:x}")], vec![1, 0, 0]);
+        assert_eq!(attrs[&format!("router_fee_{router:x}")], vec![0, 0, 0]);
+        assert_eq!(attrs["default_fee_bps"], vec![25]);
     }
 
     #[test]
@@ -307,10 +496,11 @@ mod tests {
             ],
             ..Default::default()
         };
-        let attrs = storage_attributes(&tx, &[(book, slot)]);
+        let attrs = storage_attributes(&Config::parse(PARAMS).unwrap(), &tx, &[(book, slot)]);
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0].name, "word_0");
         assert_eq!(attrs[0].value, vec![3]);
-        assert!(storage_attributes(&tx, &[(book, B256::ZERO)]).is_empty());
+        assert!(storage_attributes(&Config::parse(PARAMS).unwrap(), &tx, &[(book, B256::ZERO)])
+            .is_empty());
     }
 }
