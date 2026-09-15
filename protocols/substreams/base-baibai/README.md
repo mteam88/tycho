@@ -1,8 +1,10 @@
 # BaiBai on Base
 
 Indexes the WETH/USDC pair of BaiBai CurveBook v3. The native simulator supports
-exact-input swaps in both directions for zero-fee takers. The executor checks
-that assumption for its router at execution time. Router-level fees are separate.
+exact-input swaps in both directions with the executing router's taker fee.
+Set `DecoderContext::caller(router_address)` when registering `BaibaiState` through
+`exchange_with_decoder_context`; use the same router address as the encoder.
+A missing caller is a decode error. Router-level fees are separate.
 
 The component ID is `0x` followed by the concatenated 20-byte entrypoint and base token
 addresses (lowercase hex). Static `base` and `quote`
@@ -23,7 +25,7 @@ not require indexed contract accounts.
 All successful storage writes are tracked, including cursor consumption,
 reanchors, shape replacements, TTL changes and claim settlement. The final
 write to a slot is selected by execution ordinal, not nested call order.
-Transfer logs track WETH/USDC holdings, including direct donations and withdrawals.
+Transfer, WETH Deposit and Withdrawal logs track custody holdings, including donations.
 The simulator applies execution-block time even when there is no pool update.
 
 Bid routing limits stop before the first remaining segment with nonpositive
@@ -31,6 +33,21 @@ marginal proceeds. Later segments beyond a flat or decreasing interval are not
 advertised. Custody sizing uses a monotonic upper bound on rounded proceeds,
 at most one quote-token atomic unit above the exact output, so every smaller
 input stays within available custody. Individual quotes retain contract rounding.
+
+The entrypoint's fee state is indexed from deployment: `default_fee_bps` stores
+its default-fee slot (zero on the current implementation), and `pair_fee_<taker>` /
+`router_fee_<taker>` follow `TakerFeeSet` and `TakerFeeCleared` for this pair or
+base zero. Taker suffixes are 40 lowercase hex digits without `0x`. Override values
+are three bytes: configured (0 or 1), then big-endian uint16 bps. Clearing writes
+`000000`; configured zero is `010000`. Precedence is pair, router-wide, then default.
+
+Each simulator retains only its caller's two overrides and the venue default.
+Updates take effect with indexed blocks, without per-quote RPC calls. The fee is
+rounded up on gross output; the curve cursor consumes the gross fill while custody
+pays only net output. Limits and prices include the fee. Execution uses the router's
+existing minimum-output protection, so a fee change can cause normal slippage or a
+revert. Changes to fee semantics or storage layout require an integration update.
+Snapshots without `default_fee_bps` require reindexing with this package.
 
 ## Building and running
 
