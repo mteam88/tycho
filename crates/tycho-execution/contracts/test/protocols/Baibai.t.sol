@@ -18,9 +18,24 @@ interface IBaibaiFees {
 }
 
 contract BaibaiTest is TychoRouterTestSetup {
+    BaibaiExecutor public baibaiExecutor;
+    address internal constant BAIBAI_ENTRYPOINT =
+        0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa;
     address constant CUSTODIAN = 0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3;
     address constant BASE = 0x4200000000000000000000000000000000000006;
     address constant QUOTE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+
+    function setUp() public override {
+        super.setUp();
+        baibaiExecutor = new BaibaiExecutor(BAIBAI_ENTRYPOINT);
+        address[] memory executors = new address[](1);
+        executors[0] = address(baibaiExecutor);
+        // Register before the pinned timestamp so activation does not expire the curve.
+        vm.warp(forkTimestamp - _SETUP_TIME_OFFSET_NEW_EXECUTOR);
+        vm.prank(EXECUTOR_SETTER);
+        tychoRouter.setExecutors(executors);
+        vm.warp(forkTimestamp);
+    }
 
     function getChain() public pure override returns (string memory) {
         return "base";
