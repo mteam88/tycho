@@ -278,6 +278,8 @@ is the exception: `TychoFallbackRouter` transfers to the protocol itself, outsid
 | **Direct-to-receiver**     | UniswapV2, UniswapV3, UniswapV4, BalancerV2, BalancerV3, Ekubo, EkuboV3, Slipstreams, MaverickV2, AerodromeV1, LiquidityParty, ERC4626, FluidV1, BopAMM, FermiSwap, LunarBase, RingSwapV2, Sky, Metric, Fallback | `false`          | Dispatcher measures balance at receiver                                                          |
 | **Output-lands-at-router** | Curve, NativeWrap, Rocketpool, Etherfi, Bebop, Hashflow, Liquorice                                                                              | `true`           | Dispatcher measures at `address(this)`, then forwards via `_transferOut()` if receiver != router |
 
+BaiBai also uses direct-to-receiver output.
+
 **Two input categories**:
 
 **Direct-transfer** (UniswapV2, BalancerV2, Curve): Dispatcher staticcalls `getTransferData()` to get
