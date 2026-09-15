@@ -409,9 +409,7 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
         &global_args,
         &run_args.substreams_args,
         &[chain],
-        run_args
-            .retention_horizon
-            .unwrap_or_else(|| Utc::now().naive_utc()),
+        Utc::now().naive_utc(),
         config,
         None,
         run_args.settlement_contract,
