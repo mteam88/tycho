@@ -271,10 +271,6 @@ pub struct RunSpkgArgs {
     #[clap(long)]
     stop_block: Option<String>,
 
-    /// Keep historical state from this UTC timestamp. Defaults to the current time.
-    #[clap(long)]
-    pub retention_horizon: Option<chrono::NaiveDateTime>,
-
     /// Account addresses to be initialized before indexing
     #[clap(long, value_delimiter = ',')]
     pub initialized_accounts: Vec<Bytes>,
@@ -362,7 +358,7 @@ mod cli_tests {
 
     #[tokio::test]
     async fn test_arg_parsing_run_cmd() {
-        let args = vec![
+        let cli = Cli::try_parse_from(vec![
             "tycho-indexer",
             "--endpoint",
             "http://example.com",
@@ -385,8 +381,8 @@ mod cli_tests {
             "pt1,pt2",
             "--protocol-system",
             "test_protocol",
-        ];
-        let cli = Cli::try_parse_from(&args).expect("parse errored");
+        ])
+        .expect("parse errored");
 
         let expected_args = Cli {
             global_args: GlobalArgs {
@@ -419,7 +415,6 @@ mod cli_tests {
                 protocol_system: "test_protocol".to_string(),
                 start_block: 17361664,
                 stop_block: None,
-                retention_horizon: None,
                 substreams_args: SubstreamsArgs {
                     substreams_api_token: "your_api_token".to_string(),
                     enable_partial_blocks: false,
@@ -434,13 +429,6 @@ mod cli_tests {
         };
 
         assert_eq!(cli, expected_args);
-        let cli = Cli::try_parse_from(
-            args.into_iter()
-                .chain(["--retention-horizon", "2026-09-12T00:08:59"]),
-        )
-        .unwrap();
-        let Command::Run(run) = cli.command else { panic!("expected run command") };
-        assert_eq!(run.retention_horizon, Some("2026-09-12T00:08:59".parse().unwrap()));
     }
 
     fn args_with_delta_window(depth: &'static str, fold_batch: &'static str) -> Vec<&'static str> {
