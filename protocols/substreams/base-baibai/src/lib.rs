@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 mod config;
 
+use alloy_primitives::{b256, Address, B256, U256};
 use anyhow::Result;
 use config::Config;
 use std::collections::{BTreeMap, HashMap};
@@ -11,6 +12,14 @@ use tycho_substreams::{
     balances::{aggregate_balances_changes, extract_balance_deltas_from_tx, store_balance_changes},
     prelude::*,
 };
+
+// Layout and pricing were validated through this block. Later proxy upgrades require review.
+const VALIDATED_BLOCK: u64 = 51_191_196;
+const TAKER_FEE_SET: B256 =
+    b256!("1f50e1aaaff835659bf08a8d3473edefb7f61e28a27572c62fa8daa40da9e268");
+const TAKER_FEE_CLEARED: B256 =
+    b256!("4e36b92da5e2a98be73ea9f9bd228101bb4b4e83629908148cef524aaad69b94");
+const UPGRADED: B256 = b256!("bc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b");
 
 #[substreams::handlers::map]
 pub fn map_components(
@@ -82,6 +91,16 @@ pub fn map_protocol_changes(
     balances: StoreDeltas,
     deltas: BlockBalanceDeltas,
 ) -> Result<BlockChanges> {
+    protocol_changes(params, block, components, balances, deltas)
+}
+
+fn protocol_changes(
+    params: String,
+    block: eth::v2::Block,
+    components: BlockTransactionProtocolComponents,
+    balances: StoreDeltas,
+    deltas: BlockBalanceDeltas,
+) -> Result<BlockChanges> {
     let config = Config::parse(&params)?;
     let slots = config.slots();
     let mut changes: BTreeMap<u64, TransactionChangesBuilder> = BTreeMap::new();
@@ -100,13 +119,19 @@ pub fn map_protocol_changes(
                 .map(|i| creation_attribute(&format!("word_{i}"), vec![0; 32]))
                 .collect();
             attributes.push(creation_attribute("balance_owner", config.custodian.to_vec()));
-            attributes.push(creation_attribute("default_fee_bps", vec![0; 32]));
+            attributes.push(creation_attribute("fees_indexed", vec![1]));
             builder.add_entity_change(&EntityChanges { component_id: component.id, attributes });
         }
     }
     for tx in block.transactions() {
+        if block.number > VALIDATED_BLOCK && has_upgrade(&config, tx) {
+            changes
+                .entry(tx.index.into())
+                .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
+                .change_component_pause_state(&config.id(), true);
+        }
         let mut attrs = storage_attributes(&config, tx, &slots);
-        attrs.extend(fee_attributes(&config, tx)?);
+        attrs.extend(fee_attributes(&config, tx));
         if !attrs.is_empty() {
             changes
                 .entry(tx.index.into())
@@ -134,11 +159,24 @@ pub fn map_protocol_changes(
     })
 }
 
+/// All three dependencies are UUPS proxies. An upgrade may change storage, pricing,
+/// or immutable custody wiring; pause until the integration is reviewed and reindexed.
+fn has_upgrade(config: &Config, tx: &eth::v2::TransactionTrace) -> bool {
+    tx.logs_with_calls().any(|(log, _)| {
+        [config.entrypoint, config.curve_book, config.custodian]
+            .iter()
+            .any(|address| log.address == address.as_slice()) &&
+            log.topics
+                .first()
+                .is_some_and(|topic| topic == UPGRADED.as_slice())
+    })
+}
+
 /// Calls are nested trace order; their writes must be ordered by execution ordinal.
 fn storage_attributes(
     config: &Config,
     tx: &eth::v2::TransactionTrace,
-    slots: &[(alloy_primitives::Address, alloy_primitives::B256)],
+    slots: &[(Address, B256)],
 ) -> Vec<Attribute> {
     let mut latest = HashMap::new();
     for call in tx
@@ -175,41 +213,34 @@ fn storage_attributes(
 
 /// Fee events are emitted by the proxy, including during delegatecall. Only the final
 /// value per transaction matters; clearing an override retains an explicit unconfigured value.
-fn fee_attributes(config: &Config, tx: &eth::v2::TransactionTrace) -> Result<Vec<Attribute>> {
-    use alloy_primitives::{keccak256, Address, U256};
+fn fee_attributes(config: &Config, tx: &eth::v2::TransactionTrace) -> Vec<Attribute> {
     if !tx
         .calls
         .iter()
         .any(|call| !call.state_reverted && call.address == config.entrypoint.as_slice())
     {
-        return Ok(vec![]);
+        return vec![];
     }
-    let set = keccak256("TakerFeeSet(address,address,uint16)");
-    let clear = keccak256("TakerFeeCleared(address,address)");
     let mut latest = BTreeMap::new();
     for (log, _) in tx
         .logs_with_calls()
         .filter(|(log, _)| log.address == config.entrypoint.as_slice())
     {
         let Some(topic) = log.topics.first() else { continue };
-        if topic != set.as_slice() && topic != clear.as_slice() {
+        if topic != TAKER_FEE_SET.as_slice() && topic != TAKER_FEE_CLEARED.as_slice() {
             continue;
         }
-        anyhow::ensure!(
-            log.topics.len() == 3 && log.topics[1].len() == 32 && log.topics[2].len() == 32,
-            "invalid BaiBai fee event topics"
-        );
         let base = Address::from_slice(&log.topics[2][12..]);
         if base != config.base && !base.is_zero() {
             continue;
         }
-        let configured = topic == set.as_slice();
-        anyhow::ensure!(!configured || log.data.len() == 32, "invalid BaiBai fee event data");
+        let configured = topic == TAKER_FEE_SET.as_slice();
         let bps = if configured { U256::from_be_slice(&log.data) } else { U256::ZERO };
-        anyhow::ensure!(bps <= U256::from(1000), "invalid BaiBai fee");
+        // A pair override takes precedence over the taker-wide (base zero) fee.
+        // Configured zero is distinct from clearing an override.
         let name = format!(
             "{}_fee_{:x}",
-            if base.is_zero() { "router" } else { "pair" },
+            if base.is_zero() { "taker" } else { "pair" },
             Address::from_slice(&log.topics[1][12..])
         );
         let value = vec![u8::from(configured), (bps.to::<u16>() >> 8) as u8, bps.to::<u16>() as u8];
@@ -220,32 +251,10 @@ fn fee_attributes(config: &Config, tx: &eth::v2::TransactionTrace) -> Result<Vec
             *entry = (log.ordinal, value);
         }
     }
-    // The default-fee slot is zero on the current implementation.
-    let slot = config.default_fee_slot();
-    let mut default = None;
-    for call in tx
-        .calls
-        .iter()
-        .filter(|call| !call.state_reverted)
-    {
-        for write in &call.storage_changes {
-            if write.address == config.entrypoint.as_slice() &&
-                write.key == slot.as_slice() &&
-                default
-                    .map_or(true, |last: &eth::v2::StorageChange| write.ordinal > last.ordinal)
-            {
-                default = Some(write);
-            }
-        }
-    }
-    let mut attrs: Vec<_> = latest
+    latest
         .into_iter()
         .map(|(name, (_, value))| attribute(&name, value))
-        .collect();
-    if let Some(write) = default {
-        attrs.push(attribute("default_fee_bps", write.new_value.clone()));
-    }
-    Ok(attrs)
+        .collect()
 }
 
 fn creation_attribute(name: &str, value: Vec<u8>) -> Attribute {
@@ -402,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn fee_events_keep_explicit_zero_clear_and_final_default_in_execution_order() {
+    fn fee_events_keep_explicit_zero_and_clear_in_execution_order() {
         use alloy_primitives::{keccak256, Address, U256};
         use eth::v2::Log;
         let config = Config::parse(PARAMS).unwrap();
@@ -427,19 +436,11 @@ mod tests {
             ordinal,
             ..Default::default()
         };
-        let write = |value, ordinal| StorageChange {
-            address: config.entrypoint.to_vec(),
-            key: config.default_fee_slot().to_vec(),
-            new_value: vec![value],
-            ordinal,
-            ..Default::default()
-        };
         let tx = TransactionTrace {
             calls: vec![
                 Call {
                     address: config.entrypoint.to_vec(),
                     logs: vec![log(config.base, Some(0), 20), log(Address::ZERO, None, 30)],
-                    storage_changes: vec![write(25, 25)],
                     ..Default::default()
                 },
                 Call {
@@ -448,14 +449,13 @@ mod tests {
                         log(config.base, Some(10), 10),
                         log(Address::ZERO, Some(20), 15),
                         log(Address::repeat_byte(2), Some(100), 16),
+                        log(config.base, Some(2000), 5),
                     ],
-                    storage_changes: vec![write(50, 5)],
                     ..Default::default()
                 },
                 Call {
                     address: config.entrypoint.to_vec(),
                     logs: vec![log(config.base, Some(100), 40)],
-                    storage_changes: vec![write(100, 45)],
                     state_reverted: true,
                     ..Default::default()
                 },
@@ -463,14 +463,81 @@ mod tests {
             ..Default::default()
         };
         let attrs: HashMap<_, _> = fee_attributes(&config, &tx)
-            .unwrap()
             .into_iter()
             .map(|attr| (attr.name, attr.value))
             .collect();
-        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs.len(), 2);
         assert_eq!(attrs[&format!("pair_fee_{router:x}")], vec![1, 0, 0]);
-        assert_eq!(attrs[&format!("router_fee_{router:x}")], vec![0, 0, 0]);
-        assert_eq!(attrs["default_fee_bps"], vec![25]);
+        assert_eq!(attrs[&format!("taker_fee_{router:x}")], vec![0, 0, 0]);
+        let tx = TransactionTrace {
+            calls: vec![Call {
+                address: config.entrypoint.to_vec(),
+                logs: vec![log(config.base, Some(2000), 1)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(fee_attributes(&config, &tx)[0].value, vec![1, 7, 208]);
+    }
+
+    #[test]
+    fn dependency_upgrades_pause_routing_after_the_validated_history() {
+        use eth::v2::{Block, BlockHeader, Log};
+        let config = Config::parse(PARAMS).unwrap();
+        for dependency in [config.entrypoint, config.curve_book, config.custodian, Address::ZERO] {
+            for (number, reverted, paused) in [
+                (VALIDATED_BLOCK, false, false),
+                (VALIDATED_BLOCK + 1, false, dependency != Address::ZERO),
+                (VALIDATED_BLOCK + 1, true, false),
+            ] {
+                let block = Block {
+                    number,
+                    header: Some(BlockHeader {
+                        timestamp: Some(Default::default()),
+                        ..Default::default()
+                    }),
+                    transaction_traces: vec![TransactionTrace {
+                        status: 1,
+                        calls: vec![Call {
+                            state_reverted: reverted,
+                            logs: vec![Log {
+                                address: dependency.to_vec(),
+                                topics: vec![
+                                    UPGRADED.to_vec(),
+                                    Address::repeat_byte(1)
+                                        .into_word()
+                                        .to_vec(),
+                                ],
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let changes = protocol_changes(
+                    PARAMS.into(),
+                    block,
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap();
+                let attrs: Vec<_> = changes
+                    .changes
+                    .iter()
+                    .flat_map(|tx| &tx.entity_changes)
+                    .flat_map(|entity| &entity.attributes)
+                    .collect();
+                assert_eq!(attrs.len(), usize::from(paused));
+                if paused {
+                    assert_eq!(attrs[0].name, "paused");
+                    assert_eq!(attrs[0].value, vec![1]);
+                    assert_eq!(attrs[0].change, ChangeType::Creation as i32);
+                }
+            }
+        }
     }
 
     #[test]
