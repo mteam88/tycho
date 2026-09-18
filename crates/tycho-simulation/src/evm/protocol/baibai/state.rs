@@ -28,14 +28,14 @@ pub struct BaibaiState {
     pub(super) timestamp: u64,
     pub(super) fee_attributes: [String; 2],
     pub(super) fees: [Option<u16>; 2],
-    pub(super) default_fee: u16,
+    pub(super) paused: bool,
 }
 
 impl BaibaiState {
     fn fee_bps(&self) -> u16 {
         self.fees[0]
             .or(self.fees[1])
-            .unwrap_or(self.default_fee)
+            .unwrap_or(0)
     }
 
     fn after_fee(&self, output: U256) -> Result<U256, SimulationError> {
@@ -51,7 +51,8 @@ impl BaibaiState {
         let last: u64 = self.words[1].as_limbs()[2];
         let valid: u64 = self.words[1].as_limbs()[3];
         let ttl: u64 = self.words[0].as_limbs()[0];
-        self.words[3] != U256::ZERO &&
+        !self.paused &&
+            self.words[3] != U256::ZERO &&
             self.timestamp <= valid &&
             (ttl == 0 || u128::from(self.timestamp) <= u128::from(last) + u128::from(ttl))
     }
@@ -143,7 +144,7 @@ impl ProtocolSim for BaibaiState {
     ) -> Result<GetAmountOutResult, SimulationError> {
         let direction = self.direction(&token_in.address, &token_out.address)?;
         if !self.fresh() {
-            return Err(invalid("curve expired or uninitialized"));
+            return Err(invalid("curve paused, expired or uninitialized"));
         }
         let input = uint(&amount_in)?;
         let (output, cursor) = self
@@ -210,6 +211,15 @@ impl ProtocolSim for BaibaiState {
         _tokens: &HashMap<Bytes, Token>,
         balances: &Balances,
     ) -> Result<(), TransitionError> {
+        // Upgrade pauses are permanent for this package. Do not interpret new-layout words.
+        if self.paused ||
+            delta
+                .updated_attributes
+                .contains_key("paused")
+        {
+            self.paused = true;
+            return Ok(());
+        }
         let mut next = self.clone();
         if !delta.deleted_attributes.is_empty() {
             return Err(TransitionError::DecodeError("BaiBai state words cannot be deleted".into()));
