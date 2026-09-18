@@ -100,15 +100,12 @@ contract BaibaiTest is TychoRouterTestSetup {
         uint256 custodyBefore = IERC20(input).balanceOf(CUSTODIAN);
         vm.startPrank(BOB);
         IERC20(input).approve(tychoRouterAddr, amount);
-        bytes memory swap = encodeSingleSwap(
-            address(baibaiExecutor),
-            abi.encodePacked(BASE, uint8(sellBase ? 1 : 0))
+        bytes memory callData = loadCallDataFromFile(
+            sellBase ? "baibai_sell_base" : "baibai_buy_base"
         );
-        uint256 beforeGas = gasleft();
-        uint256 received = tychoRouter.singleSwap(
-            amount, input, output, expected, expected, BOB, noClientFee(), swap
-        );
-        emit log_named_uint("BaiBai router swap gas", beforeGas - gasleft());
+        (bool success, bytes memory result) = tychoRouterAddr.call(callData);
+        assertTrue(success, "Rust-encoded BaiBai swap failed");
+        uint256 received = abi.decode(result, (uint256));
         vm.stopPrank();
         assertEq(received, expected);
         assertEq(IERC20(output).balanceOf(BOB) - beforeBalance, expected);

@@ -60,7 +60,7 @@ pub struct DecoderContext {
     pub adapter_path: Option<String>,
     pub vm_traces: Option<bool>,
     /// Immediate caller of the venue during execution (the router for delegatecall executors).
-    /// Required by caller-priced protocols such as BaiBai; must match the execution path.
+    /// Caller-priced protocols may supply a default; set this to match a custom execution path.
     pub caller: Option<Bytes>,
     /// What quotes may assume about the swap's position within its execution block.
     ///

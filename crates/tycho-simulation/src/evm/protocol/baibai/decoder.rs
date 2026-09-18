@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
-use alloy::primitives::U256;
+use alloy::primitives::{address, U256};
 use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader};
-use tycho_common::{models::token::Token, Bytes};
+use tycho_common::{
+    models::{token::Token, Chain},
+    Bytes,
+};
 
 use super::BaibaiState;
 use crate::protocol::{
@@ -43,6 +46,18 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
         all_tokens: &HashMap<Bytes, Token>,
         context: &DecoderContext,
     ) -> Result<Self, Self::Error> {
+        if snapshot.component.chain != Chain::Base {
+            return Err(InvalidSnapshotError::ValueError("BaiBai is only supported on Base".into()));
+        }
+        if snapshot
+            .state
+            .attributes
+            .contains_key("paused")
+        {
+            return Err(InvalidSnapshotError::ValueError(
+                "BaiBai is paused after an upgrade".into(),
+            ));
+        }
         let base = snapshot
             .component
             .static_attributes
@@ -83,16 +98,16 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
             .ok_or_else(|| {
                 InvalidSnapshotError::ValueError("quote decimals exceed uint256".into())
             })?;
+        // Match tycho-execution's default Base router; custom executors supply their caller.
+        let default_caller =
+            Bytes::from(address!("AbA5B53b03eAfaD1C5fc8BD5Fc765fC85Bb3de67").to_vec());
         let caller = context
             .caller
             .as_ref()
-            .filter(|caller| caller.len() == 20)
-            .ok_or_else(|| {
-                InvalidSnapshotError::ValueError(
-                    "BaiBai requires DecoderContext::caller with the execution router address"
-                        .into(),
-                )
-            })?;
+            .unwrap_or(&default_caller);
+        if caller.len() != 20 {
+            return Err(InvalidSnapshotError::ValueError("invalid BaiBai caller address".into()));
+        }
         let mut state = Self {
             id: snapshot.component.id.clone(),
             tokens: [base, quote],
@@ -102,18 +117,18 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
             timestamp: block.timestamp,
             fee_attributes: [
                 format!("pair_fee_{}", hex::encode(caller)),
-                format!("router_fee_{}", hex::encode(caller)),
+                format!("taker_fee_{}", hex::encode(caller)),
             ],
             fees: [None; 2],
-            default_fee: 0,
+            paused: false,
         };
         apply_words(&mut state.words, &snapshot.state.attributes, true)?;
         if !snapshot
             .state
             .attributes
-            .contains_key("default_fee_bps")
+            .contains_key("fees_indexed")
         {
-            return Err(InvalidSnapshotError::MissingAttribute("default_fee_bps".into()));
+            return Err(InvalidSnapshotError::MissingAttribute("fees_indexed".into()));
         }
         apply_fees(&mut state, &snapshot.state.attributes)?;
         for (i, token) in state.tokens.iter().enumerate() {
@@ -141,13 +156,6 @@ pub(super) fn apply_fees(
     attrs: &HashMap<String, Bytes>,
 ) -> Result<(), InvalidSnapshotError> {
     let invalid = || InvalidSnapshotError::ValueError("invalid BaiBai fee attribute".into());
-    if let Some(value) = attrs.get("default_fee_bps") {
-        let value = word(value)? & U256::from(u16::MAX);
-        if value > U256::from(1000) {
-            return Err(invalid());
-        }
-        state.default_fee = value.to::<u16>();
-    }
     for (name, fee) in state
         .fee_attributes
         .iter()
