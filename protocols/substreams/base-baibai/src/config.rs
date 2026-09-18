@@ -1,5 +1,5 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use substreams_ethereum::pb::eth::v2::{Block, TransactionTrace};
 
 #[derive(serde::Deserialize)]
@@ -14,23 +14,7 @@ pub struct Config {
 
 impl Config {
     pub fn parse(params: &str) -> Result<Self> {
-        let config: Self = serde_qs::from_str(params)?;
-        let addresses =
-            [config.entrypoint, config.curve_book, config.custodian, config.base, config.quote];
-        ensure!(
-            addresses
-                .iter()
-                .all(|address| !address.is_zero()),
-            "zero BaiBai address"
-        );
-        for (i, address) in addresses.iter().enumerate() {
-            ensure!(!addresses[..i].contains(address), "duplicate BaiBai address");
-        }
-        Ok(config)
-    }
-
-    pub fn default_fee_slot(&self) -> B256 {
-        B256::from(namespace("baibai.storage.Entrypoint") + U256::from(1))
+        Ok(serde_qs::from_str(params)?)
     }
 
     pub fn id(&self) -> String {
