@@ -49,10 +49,10 @@ fn state(fixture: &Fixture, scenario: &Scenario) -> BaibaiState {
         timestamp: fixture.timestamp,
         fee_attributes: [
             format!("pair_fee_{}", hex::encode([1; 20])),
-            format!("router_fee_{}", hex::encode([1; 20])),
+            format!("taker_fee_{}", hex::encode([1; 20])),
         ],
         fees: [None; 2],
-        default_fee: 0,
+        paused: false,
     }
 }
 
@@ -205,6 +205,7 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
     let snapshot = ComponentWithState {
         component: ProtocolComponent {
             id: expected.id.clone(),
+            chain: tycho_common::dto::Chain::Base,
             protocol_system: "baibai".into(),
             protocol_type_name: "baibai_pool".into(),
             tokens: vec![expected.tokens[1].clone(), expected.tokens[0].clone()],
@@ -222,7 +223,7 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
                 .iter()
                 .enumerate()
                 .map(|(i, word)| (format!("word_{i}"), Bytes::from(word.to_be_bytes::<32>())))
-                .chain([(String::from("default_fee_bps"), Bytes::from([0u8; 32]))])
+                .chain([(String::from("fees_indexed"), Bytes::from([1u8]))])
                 .collect(),
             balances: expected
                 .tokens
@@ -248,6 +249,69 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
     .await
     .unwrap();
     assert_eq!(decoded, expected);
+    let mut with_fee = snapshot.clone();
+    with_fee.state.attributes.insert(
+        "taker_fee_aba5b53b03eafad1c5fc8bd5fc765fc85bb3de67".into(),
+        Bytes::from([1, 0, 25]),
+    );
+    let fallback = BaibaiState::try_from_with_header(
+        with_fee,
+        header.clone(),
+        &HashMap::new(),
+        &all_tokens,
+        &DecoderContext::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fallback.fee(), 0.0025);
+    let mut wrong_chain = snapshot.clone();
+    wrong_chain.component.chain = Chain::Ethereum;
+    assert!(BaibaiState::try_from_with_header(
+        wrong_chain,
+        header.clone(),
+        &HashMap::new(),
+        &all_tokens,
+        &DecoderContext::new(),
+    )
+    .await
+    .is_err());
+    assert!(BaibaiState::try_from_with_header(
+        snapshot.clone(),
+        header.clone(),
+        &HashMap::new(),
+        &all_tokens,
+        &DecoderContext::new().caller(Bytes::from([1u8; 19])),
+    )
+    .await
+    .is_err());
+    let mut without_fees = snapshot.clone();
+    without_fees
+        .state
+        .attributes
+        .remove("fees_indexed");
+    assert!(BaibaiState::try_from_with_header(
+        without_fees,
+        header.clone(),
+        &HashMap::new(),
+        &all_tokens,
+        &DecoderContext::new(),
+    )
+    .await
+    .is_err());
+    let mut paused = snapshot.clone();
+    paused
+        .state
+        .attributes
+        .insert("paused".into(), Bytes::from([1u8]));
+    assert!(BaibaiState::try_from_with_header(
+        paused,
+        header.clone(),
+        &HashMap::new(),
+        &all_tokens,
+        &DecoderContext::new(),
+    )
+    .await
+    .is_err());
     let mut incomplete = snapshot;
     incomplete
         .state
@@ -365,22 +429,20 @@ fn fees_follow_override_precedence_and_updates_are_atomic() {
         assert_eq!(state.fee(), expected);
     };
     let pair = format!("pair_fee_{}", hex::encode([1; 20]));
-    let router = format!("router_fee_{}", hex::encode([1; 20]));
-    update(vec![("default_fee_bps".into(), Bytes::from([0, 25]))], 0.0025);
+    let router = format!("taker_fee_{}", hex::encode([1; 20]));
     update(vec![(router.clone(), Bytes::from([1, 0, 10]))], 0.001);
     update(vec![(pair.clone(), Bytes::from([1, 0, 0]))], 0.0);
-    update(vec![("default_fee_bps".into(), Bytes::from([0, 50]))], 0.0);
     update(vec![(pair, Bytes::from([0, 0, 0]))], 0.001);
-    update(vec![(router, Bytes::from([0, 0, 0]))], 0.005);
-    update(vec![(format!("pair_fee_{}", hex::encode([2; 20])), Bytes::from([1, 3, 232]))], 0.005);
+    update(vec![(router, Bytes::from([0, 0, 0]))], 0.0);
+    update(vec![(format!("pair_fee_{}", hex::encode([2; 20])), Bytes::from([1, 3, 232]))], 0.0);
     let before = state.clone();
     assert!(state
         .delta_transition(
             ProtocolStateDelta {
                 component_id: state.id.clone(),
                 updated_attributes: HashMap::from([(
-                    "default_fee_bps".into(),
-                    Bytes::from([3, 233])
+                    format!("taker_fee_{}", hex::encode([1; 20])),
+                    Bytes::from([1, 3, 233])
                 )]),
                 deleted_attributes: Default::default(),
             },
@@ -399,7 +461,7 @@ fn fees_round_up_retain_custody_and_limits_bound_net_output() {
         let tokens = tokens(&gross);
         for bps in [1u16, 25, 1000] {
             let mut net = gross.clone();
-            net.default_fee = bps;
+            net.fees[1] = Some(bps);
             for case in &scenario.cases {
                 let input = BigUint::from_str(&case.input).unwrap();
                 let expected =
@@ -458,6 +520,45 @@ fn fees_round_up_retain_custody_and_limits_bound_net_output() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn upgrade_pause_stays_closed_across_subsequent_updates() {
+    let fixture = fixture();
+    let mut state = state(&fixture, &fixture.scenarios[0]);
+    let tokens = tokens(&state);
+    assert!(state.fresh());
+    for attrs in [
+        HashMap::from([("paused".into(), Bytes::from([1u8]))]),
+        // A new implementation's storage is not safe to interpret, even when malformed.
+        HashMap::from([("word_0".into(), Bytes::from([255u8; 33]))]),
+    ] {
+        state
+            .delta_transition(
+                ProtocolStateDelta {
+                    component_id: state.id.clone(),
+                    updated_attributes: attrs,
+                    deleted_attributes: Default::default(),
+                },
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+        assert!(!state.fresh());
+        for direction in 0..2 {
+            let (input, output) = (&tokens[direction], &tokens[1 - direction]);
+            assert!(state
+                .get_amount_out(BigUint::from(1u8), input, output)
+                .is_err());
+            assert!(state.spot_price(input, output).is_err());
+            assert_eq!(
+                state
+                    .get_limits(input.address.clone(), output.address.clone())
+                    .unwrap(),
+                (BigUint::ZERO, BigUint::ZERO)
+            );
         }
     }
 }
