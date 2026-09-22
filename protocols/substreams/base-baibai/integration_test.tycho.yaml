@@ -15,4 +15,4 @@ tests:
         tokens:
           - "0x4200000000000000000000000000000000000006"
           - "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-        creation_tx: "0x9415e76fda4cb82bb41690da2eb670eec1fa53ac93d31f1b2171d9d06a8450af"
+        creation_tx: "0xd3ef5d663bbdd90951f81f55f4abab7c9003db24ee9c0ca2e0fa087ec8a1a02e"
