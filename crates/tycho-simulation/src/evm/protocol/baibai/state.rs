@@ -28,10 +28,28 @@ pub struct BaibaiState {
     pub(super) timestamp: u64,
     pub(super) fee_attributes: [String; 2],
     pub(super) fees: [Option<u16>; 2],
-    pub(super) paused: bool,
 }
 
 impl BaibaiState {
+    /// Copy shared-token custody from a later state in the same simulated route.
+    ///
+    /// Callers must group pools by their `custodian` static attribute and call this after
+    /// each swap before quoting siblings or recomputing their limits. Keep candidate routes'
+    /// states separate: indexed balances and per-pool limits alone do not prevent a split
+    /// route from spending the same custody twice. Pair curves and cursors are unchanged.
+    pub fn sync_custody(&mut self, from: &Self) {
+        for (i, token) in self.tokens.iter().enumerate() {
+            if let Some(j) = from
+                .tokens
+                .iter()
+                .position(|other| other == token)
+            {
+                self.balances[i] = from.balances[j];
+                self.words[30 + i] = from.words[30 + j];
+            }
+        }
+    }
+
     fn fee_bps(&self) -> u16 {
         self.fees[0]
             .or(self.fees[1])
@@ -51,8 +69,7 @@ impl BaibaiState {
         let last: u64 = self.words[1].as_limbs()[2];
         let valid: u64 = self.words[1].as_limbs()[3];
         let ttl: u64 = self.words[0].as_limbs()[0];
-        !self.paused &&
-            self.words[3] != U256::ZERO &&
+        self.words[3] != U256::ZERO &&
             self.timestamp <= valid &&
             (ttl == 0 || u128::from(self.timestamp) <= u128::from(last) + u128::from(ttl))
     }
@@ -144,7 +161,7 @@ impl ProtocolSim for BaibaiState {
     ) -> Result<GetAmountOutResult, SimulationError> {
         let direction = self.direction(&token_in.address, &token_out.address)?;
         if !self.fresh() {
-            return Err(invalid("curve paused, expired or uninitialized"));
+            return Err(invalid("curve expired or uninitialized"));
         }
         let input = uint(&amount_in)?;
         let (output, cursor) = self
@@ -211,15 +228,6 @@ impl ProtocolSim for BaibaiState {
         _tokens: &HashMap<Bytes, Token>,
         balances: &Balances,
     ) -> Result<(), TransitionError> {
-        // Upgrade pauses are permanent for this package. Do not interpret new-layout words.
-        if self.paused ||
-            delta
-                .updated_attributes
-                .contains_key("paused")
-        {
-            self.paused = true;
-            return Ok(());
-        }
         let mut next = self.clone();
         if !delta.deleted_attributes.is_empty() {
             return Err(TransitionError::DecodeError("BaiBai state words cannot be deleted".into()));

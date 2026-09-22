@@ -15,20 +15,30 @@ binaries:
     type: wasm/rust-v1
     file: ../target/wasm32-unknown-unknown/release/base_baibai.wasm
 modules:
-  - name: map_components
-    kind: map
+  - name: store_state
+    kind: store
     initialBlock: 50895895
+    updatePolicy: set
+    valueType: bytes
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
-    output:
-      type: proto:tycho.evm.v1.BlockTransactionProtocolComponents
+  - name: store_keys
+    kind: store
+    initialBlock: 50895895
+    updatePolicy: append
+    valueType: string
+    inputs:
+      - store: store_state
+        mode: deltas
   - name: map_balances
     kind: map
     initialBlock: 50895895
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
+      - store: store_keys
+        mode: get
     output:
       type: proto:tycho.evm.v1.BlockBalanceDeltas
   - name: store_balances
@@ -44,14 +54,20 @@ modules:
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
-      - map: map_components
+      - store: store_state
+        mode: deltas
       - store: store_balances
         mode: deltas
-      - map: map_balances
+      - store: store_state
+        mode: get
+      - store: store_keys
+        mode: get
+      - store: store_balances
+        mode: get
     output:
       type: proto:tycho.evm.v1.BlockChanges
 params:
-  map_components: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&base=0x4200000000000000000000000000000000000006&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
-  map_balances: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&base=0x4200000000000000000000000000000000000006&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
-  map_protocol_changes: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&base=0x4200000000000000000000000000000000000006&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
+  store_state: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
+  map_balances: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
+  map_protocol_changes: "entrypoint=0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa&curve_book=0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5&custodian=0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3&quote=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913&start_block=50895895"
 network: base
