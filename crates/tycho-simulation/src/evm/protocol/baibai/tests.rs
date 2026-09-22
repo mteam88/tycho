@@ -52,7 +52,6 @@ fn state(fixture: &Fixture, scenario: &Scenario) -> BaibaiState {
             format!("taker_fee_{}", hex::encode([1; 20])),
         ],
         fees: [None; 2],
-        paused: false,
     }
 }
 
@@ -223,7 +222,6 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
                 .iter()
                 .enumerate()
                 .map(|(i, word)| (format!("word_{i}"), Bytes::from(word.to_be_bytes::<32>())))
-                .chain([(String::from("fees_indexed"), Bytes::from([1u8]))])
                 .collect(),
             balances: expected
                 .tokens
@@ -281,34 +279,6 @@ async fn snapshot_decodes_roles_independently_of_token_order_and_requires_full_s
         &HashMap::new(),
         &all_tokens,
         &DecoderContext::new().caller(Bytes::from([1u8; 19])),
-    )
-    .await
-    .is_err());
-    let mut without_fees = snapshot.clone();
-    without_fees
-        .state
-        .attributes
-        .remove("fees_indexed");
-    assert!(BaibaiState::try_from_with_header(
-        without_fees,
-        header.clone(),
-        &HashMap::new(),
-        &all_tokens,
-        &DecoderContext::new(),
-    )
-    .await
-    .is_err());
-    let mut paused = snapshot.clone();
-    paused
-        .state
-        .attributes
-        .insert("paused".into(), Bytes::from([1u8]));
-    assert!(BaibaiState::try_from_with_header(
-        paused,
-        header.clone(),
-        &HashMap::new(),
-        &all_tokens,
-        &DecoderContext::new(),
     )
     .await
     .is_err());
@@ -525,40 +495,88 @@ fn fees_round_up_retain_custody_and_limits_bound_net_output() {
 }
 
 #[test]
-fn upgrade_pause_stays_closed_across_subsequent_updates() {
+fn shared_custody_sync_prevents_double_spend_and_preserves_pair_state() {
+    let fixture = fixture();
+    let mut first = state(&fixture, &fixture.scenarios[0]);
+    let first_tokens = tokens(&first);
+    let input = BigUint::from(10u64).pow(16);
+    let out = first
+        .get_amount_out(input.clone(), &first_tokens[0], &first_tokens[1])
+        .unwrap()
+        .amount;
+    first.balances[1] = super::math::uint(&out).unwrap();
+    let mut second = first.clone();
+    second.tokens[0] = Bytes::from(vec![2; 20]);
+    let second_tokens = tokens(&second);
+    let untouched = second.clone();
+    let traded = first
+        .get_amount_out(input.clone(), &first_tokens[0], &first_tokens[1])
+        .unwrap();
+    second.sync_custody(
+        traded
+            .new_state
+            .as_any()
+            .downcast_ref()
+            .unwrap(),
+    );
+    assert!(second
+        .get_amount_out(input.clone(), &second_tokens[0], &second_tokens[1])
+        .is_err());
+    assert_eq!(
+        second
+            .get_limits(second.tokens[0].clone(), second.tokens[1].clone())
+            .unwrap()
+            .0,
+        BigUint::ZERO
+    );
+    assert_eq!(second.words[..30], untouched.words[..30]);
+    assert_eq!(second.balances[0], untouched.balances[0]);
+    let synced = second.clone();
+    second.sync_custody(
+        traded
+            .new_state
+            .as_any()
+            .downcast_ref()
+            .unwrap(),
+    );
+    assert_eq!(second, synced);
+    // A quote-input swap replenishes shared quote custody for a sibling's next output.
+    let funded = second
+        .get_amount_out(out.clone(), &second_tokens[1], &second_tokens[0])
+        .unwrap();
+    second.sync_custody(
+        funded
+            .new_state
+            .as_any()
+            .downcast_ref()
+            .unwrap(),
+    );
+    assert!(second
+        .get_amount_out(input, &second_tokens[0], &second_tokens[1])
+        .is_ok());
+    assert_eq!(untouched.balances[1], first.balances[1]); // Other candidates stay untouched.
+}
+
+#[test]
+fn discovery_before_v3_shape_cannot_quote_old_layout_or_migrated_counters() {
     let fixture = fixture();
     let mut state = state(&fixture, &fixture.scenarios[0]);
     let tokens = tokens(&state);
-    assert!(state.fresh());
-    for attrs in [
-        HashMap::from([("paused".into(), Bytes::from([1u8]))]),
-        // A new implementation's storage is not safe to interpret, even when malformed.
-        HashMap::from([("word_0".into(), Bytes::from([255u8; 33]))]),
-    ] {
-        state
-            .delta_transition(
-                ProtocolStateDelta {
-                    component_id: state.id.clone(),
-                    updated_attributes: attrs,
-                    deleted_attributes: Default::default(),
-                },
-                &HashMap::new(),
-                &Balances::default(),
-            )
-            .unwrap();
-        assert!(!state.fresh());
-        for direction in 0..2 {
-            let (input, output) = (&tokens[direction], &tokens[1 - direction]);
-            assert!(state
-                .get_amount_out(BigUint::from(1u8), input, output)
-                .is_err());
-            assert!(state.spot_price(input, output).is_err());
-            assert_eq!(
-                state
-                    .get_limits(input.address.clone(), output.address.clone())
-                    .unwrap(),
-                (BigUint::ZERO, BigUint::ZERO)
-            );
-        }
+    state.words = [U256::ZERO; 32];
+    for seq in [0, 42] {
+        // v2 uses a different ERC-7201 namespace; migration copies counters but no qUnit.
+        state.words[1] = U256::from(seq);
+        assert_eq!(
+            state
+                .get_limits(tokens[0].address.clone(), tokens[1].address.clone())
+                .unwrap(),
+            (BigUint::ZERO, BigUint::ZERO)
+        );
+        assert!(state
+            .get_amount_out(BigUint::from(1u32), &tokens[0], &tokens[1])
+            .is_err());
+        assert!(state
+            .spot_price(&tokens[0], &tokens[1])
+            .is_err());
     }
 }

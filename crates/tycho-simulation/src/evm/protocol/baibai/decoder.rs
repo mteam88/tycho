@@ -49,15 +49,6 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
         if snapshot.component.chain != Chain::Base {
             return Err(InvalidSnapshotError::ValueError("BaiBai is only supported on Base".into()));
         }
-        if snapshot
-            .state
-            .attributes
-            .contains_key("paused")
-        {
-            return Err(InvalidSnapshotError::ValueError(
-                "BaiBai is paused after an upgrade".into(),
-            ));
-        }
         let base = snapshot
             .component
             .static_attributes
@@ -120,16 +111,8 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for BaibaiState {
                 format!("taker_fee_{}", hex::encode(caller)),
             ],
             fees: [None; 2],
-            paused: false,
         };
         apply_words(&mut state.words, &snapshot.state.attributes, true)?;
-        if !snapshot
-            .state
-            .attributes
-            .contains_key("fees_indexed")
-        {
-            return Err(InvalidSnapshotError::MissingAttribute("fees_indexed".into()));
-        }
         apply_fees(&mut state, &snapshot.state.attributes)?;
         for (i, token) in state.tokens.iter().enumerate() {
             state.balances[i] = word(

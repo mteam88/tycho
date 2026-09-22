@@ -1,19 +1,22 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 mod config;
 
-use alloy_primitives::{b256, Address, B256, U256};
+use alloy_primitives::{b256, keccak256, Address, B256, U256};
 use anyhow::Result;
-use config::Config;
-use std::collections::{BTreeMap, HashMap};
-use substreams::{pb::substreams::StoreDeltas, prelude::*};
-use substreams_ethereum::pb::eth;
+use config::{mapping, namespace, Config};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use substreams::{
+    pb::substreams::{store_delta::Operation, StoreDeltas},
+    prelude::*,
+    scalar::BigInt,
+};
+use substreams_ethereum::pb::eth::v2::Block;
 use tycho_substreams::{
     abi::erc20::functions::BalanceOf,
-    balances::{aggregate_balances_changes, extract_balance_deltas_from_tx, store_balance_changes},
+    balances::{extract_balance_deltas_from_tx, store_balance_changes},
     prelude::*,
 };
 
-// Layout and pricing were validated through this block. Later proxy upgrades require review.
 const VALIDATED_BLOCK: u64 = 51_191_196;
 const TAKER_FEE_SET: B256 =
     b256!("1f50e1aaaff835659bf08a8d3473edefb7f61e28a27572c62fa8daa40da9e268");
@@ -21,61 +24,207 @@ const TAKER_FEE_CLEARED: B256 =
     b256!("4e36b92da5e2a98be73ea9f9bd228101bb4b4e83629908148cef524aaad69b94");
 const UPGRADED: B256 = b256!("bc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b");
 
-#[substreams::handlers::map]
-pub fn map_components(
-    params: String,
-    block: eth::v2::Block,
-) -> Result<BlockTransactionProtocolComponents> {
-    let config = Config::parse(&params)?;
-    let mut tx_components = vec![];
-    if block.number == config.start_block {
-        let component = ProtocolComponent::new(&config.id())
-            .with_tokens(&[config.base, config.quote])
-            .as_swap_type("baibai_pool", ImplementationType::Custom)
-            .with_attributes(&[("base", config.base.to_vec()), ("quote", config.quote.to_vec())]);
-        tx_components.push(TransactionProtocolComponents {
-            tx: Some(config.creation(&block)?.into()),
-            components: vec![component],
-        });
-    }
-    Ok(BlockTransactionProtocolComponents { tx_components })
+type ReadStore<'a> = &'a dyn Fn(u64, &str) -> Option<Vec<u8>>;
+
+fn word_key(address: Address, slot: B256) -> String {
+    format!("word:{address:x}:{slot:x}")
 }
 
-#[substreams::handlers::map]
-pub fn map_balances(params: String, block: eth::v2::Block) -> Result<BlockBalanceDeltas> {
-    relative_balances(&Config::parse(&params)?, &block)
+fn addresses(read: ReadStore<'_>, ordinal: u64, key: &str) -> Vec<Address> {
+    read(ordinal, key).map_or_else(Vec::new, |value| {
+        // Written only by store_keys; append's wire encoding is semicolon-delimited.
+        String::from_utf8(value)
+            .unwrap()
+            .split(';')
+            .filter(|v| !v.is_empty())
+            .map(|v| v.parse().unwrap())
+            .collect()
+    })
 }
 
-fn relative_balances(config: &Config, block: &eth::v2::Block) -> Result<BlockBalanceDeltas> {
-    let mut balance_deltas = vec![];
-    if block.number == config.start_block {
-        let tx = config.creation(block)?;
-        for token in [config.base, config.quote] {
-            // Seed the post-block balance once. Transfers in this block are already included.
-            let balance = BalanceOf { owner: config.custodian.to_vec() }
-                .call(token.to_vec())
-                .ok_or_else(|| anyhow::anyhow!("BaiBai initial balanceOf failed for {token}"))?;
-            balance_deltas.push(BalanceDelta {
-                ord: tx.begin_ordinal,
-                tx: Some(tx.into()),
-                token: token.to_vec(),
-                delta: balance.to_signed_bytes_be(),
-                component_id: config.id().into_bytes(),
-            });
+/// Keep latest words and fees independently of pair discovery. Fees and claims can
+/// predate a first SHAPE, and migration can initialize counters without emitting it.
+fn state_changes(config: &Config, block: &Block) -> Vec<(u64, String, Vec<u8>)> {
+    let curve_updated = keccak256("CurveUpdated(address,uint64,uint64,bytes32)");
+    let settled = keccak256("WithdrawSettled(address,address,uint256,uint256,uint64)");
+    let executed = keccak256("WithdrawExecuted(address,address,uint256)");
+    let claims = namespace("baibai.storage.Custodian") + U256::from(2);
+    let mut changes = Vec::new();
+    for tx in block.transactions() {
+        let mut claim_slots = BTreeSet::new();
+        for (log, _) in tx.logs_with_calls() {
+            let Some(topic) = log.topics.first() else { continue };
+            if log.address == config.curve_book.as_slice() && topic == curve_updated.as_slice() {
+                let base = Address::from_slice(&log.topics[1][12..]);
+                changes.push((log.ordinal, format!("pair:{base:x}"), vec![1]));
+            }
+            if log.address == config.entrypoint.as_slice() &&
+                (topic == TAKER_FEE_SET.as_slice() || topic == TAKER_FEE_CLEARED.as_slice())
+            {
+                let taker = Address::from_slice(&log.topics[1][12..]);
+                let base = Address::from_slice(&log.topics[2][12..]);
+                let configured = topic == TAKER_FEE_SET.as_slice();
+                let bps = if configured { U256::from_be_slice(&log.data).to::<u16>() } else { 0 };
+                changes.push((
+                    log.ordinal,
+                    format!("fee:{base:x}:{taker:x}"),
+                    vec![u8::from(configured), (bps >> 8) as u8, bps as u8],
+                ));
+            }
+            if log.address == config.custodian.as_slice() &&
+                (topic == settled.as_slice() || topic == executed.as_slice())
+            {
+                let token = U256::from_be_slice(&log.topics[2]);
+                claim_slots.insert(B256::from(mapping(token, claims)));
+            }
+            if block.number > VALIDATED_BLOCK &&
+                topic == UPGRADED.as_slice() &&
+                [config.entrypoint, config.curve_book, config.custodian]
+                    .iter()
+                    .any(|a| log.address == a.as_slice())
+            {
+                changes.push((log.ordinal, "paused".into(), vec![1]));
+            }
         }
-    } else {
-        for tx in block.transactions() {
-            for mut delta in extract_balance_deltas_from_tx(tx, |token, owner| {
-                owner == config.custodian.as_slice() &&
-                    (token == config.base.as_slice() || token == config.quote.as_slice())
-            }) {
-                delta.component_id = config.id().into_bytes();
-                balance_deltas.push(delta);
+        for call in tx
+            .calls
+            .iter()
+            .filter(|c| !c.state_reverted)
+        {
+            for write in &call.storage_changes {
+                let address = Address::from_slice(&write.address);
+                let slot = B256::from_slice(&write.key);
+                if address == config.curve_book ||
+                    (address == config.custodian && claim_slots.contains(&slot))
+                {
+                    changes.push((write.ordinal, word_key(address, slot), write.new_value.clone()));
+                }
             }
         }
     }
-    balance_deltas.sort_unstable_by_key(|delta| delta.ord);
-    Ok(BlockBalanceDeltas { balance_deltas })
+    changes.sort_by_key(|c| c.0);
+    changes
+}
+
+#[substreams::handlers::store]
+pub fn store_state(params: String, block: Block, store: StoreSetRaw) {
+    let config = Config::parse(&params).unwrap();
+    for (ordinal, key, value) in state_changes(&config, &block) {
+        store.set(ordinal, key, &value);
+    }
+}
+
+/// Index keys once, not on every update. Its size is proportional to distinct bases
+/// and configured takers, rather than the number of publications or fee changes.
+#[substreams::handlers::store]
+pub fn store_keys(changes: StoreDeltas, store: StoreAppend<String>) {
+    for delta in changes
+        .deltas
+        .into_iter()
+        .filter(|d| d.operation == Operation::Create as i32)
+    {
+        if let Some(base) = delta.key.strip_prefix("pair:") {
+            store.append(delta.ordinal, "pairs", base.to_string());
+        } else if let Some(fee) = delta.key.strip_prefix("fee:") {
+            let (base, taker) = fee.split_once(':').unwrap();
+            store.append(delta.ordinal, format!("fees:{base}"), taker.to_string());
+        }
+    }
+}
+
+fn balance_key(config: &Config, token: Address) -> String {
+    format!("{:x}:{token:x}", config.custodian)
+}
+
+/// Track actual custody once per token. New tokens are bootstrapped at the start
+/// of their discovery block by subtracting that block's deltas from balanceOf(end).
+fn balance_deltas(
+    config: &Config,
+    block: &Block,
+    keys: ReadStore<'_>,
+    balance_of: &dyn Fn(Address) -> Result<BigInt>,
+) -> Result<BlockBalanceDeltas> {
+    let bases = addresses(keys, u64::MAX, "pairs");
+    let previous: BTreeSet<_> = addresses(keys, 0, "pairs")
+        .into_iter()
+        .collect();
+    let mut tokens: BTreeSet<_> = bases.iter().copied().collect();
+    tokens.insert(config.quote);
+    let mut deltas = Vec::new();
+    for tx in block.transactions() {
+        for mut delta in extract_balance_deltas_from_tx(tx, |token, owner| {
+            owner == config.custodian.as_slice() && tokens.contains(&Address::from_slice(token))
+        }) {
+            delta.component_id = format!("{:x}", config.custodian).into_bytes();
+            deltas.push(delta);
+        }
+    }
+    let mut new_tokens: BTreeSet<_> = bases
+        .into_iter()
+        .filter(|b| !previous.contains(b))
+        .collect();
+    if block.number == config.start_block {
+        new_tokens.insert(config.quote);
+    }
+    if !new_tokens.is_empty() {
+        let tx = block
+            .transactions()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing bootstrap transaction"))?;
+        for token in new_tokens {
+            let net = deltas
+                .iter()
+                .filter(|d| d.token == token.as_slice())
+                .fold(BigInt::zero(), |sum, d| sum + BigInt::from_signed_bytes_be(&d.delta));
+            let opening = balance_of(token)? - net;
+            anyhow::ensure!(opening >= BigInt::zero(), "negative opening custody balance");
+            deltas.push(BalanceDelta {
+                ord: tx.begin_ordinal,
+                tx: Some(tx.into()),
+                token: token.to_vec(),
+                delta: opening.to_signed_bytes_be(),
+                component_id: format!("{:x}", config.custodian).into_bytes(),
+            });
+        }
+    }
+    deltas.sort_by_key(|d| (d.ord, d.token.clone()));
+    // A self-transfer yields equal and opposite deltas at the same ordinal.
+    // The balance store requires strictly increasing ordinals per token.
+    let mut merged: Vec<BalanceDelta> = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        if let Some(previous) = merged
+            .last_mut()
+            .filter(|p| p.ord == delta.ord && p.token == delta.token)
+        {
+            previous.delta = (BigInt::from_signed_bytes_be(&previous.delta) +
+                BigInt::from_signed_bytes_be(&delta.delta))
+            .to_signed_bytes_be();
+        } else {
+            merged.push(delta);
+        }
+    }
+    Ok(BlockBalanceDeltas { balance_deltas: merged })
+}
+
+#[substreams::handlers::map]
+pub fn map_balances(params: String, block: Block, keys: StoreGetRaw) -> Result<BlockBalanceDeltas> {
+    let config = Config::parse(&params)?;
+    balance_deltas(
+        &config,
+        &block,
+        &|ord, key| {
+            if ord == 0 {
+                keys.get_first(key)
+            } else {
+                keys.get_last(key)
+            }
+        },
+        &|token| {
+            BalanceOf { owner: config.custodian.to_vec() }
+                .call(token.to_vec())
+                .ok_or_else(|| anyhow::anyhow!("BaiBai initial balanceOf failed for {token}"))
+        },
+    )
 }
 
 #[substreams::handlers::store]
@@ -83,491 +232,197 @@ pub fn store_balances(deltas: BlockBalanceDeltas, store: StoreAddBigInt) {
     store_balance_changes(deltas, store);
 }
 
-#[substreams::handlers::map]
-pub fn map_protocol_changes(
-    params: String,
-    block: eth::v2::Block,
-    components: BlockTransactionProtocolComponents,
-    balances: StoreDeltas,
-    deltas: BlockBalanceDeltas,
-) -> Result<BlockChanges> {
-    protocol_changes(params, block, components, balances, deltas)
+fn attribute(name: &str, value: Vec<u8>, creation: bool) -> Attribute {
+    Attribute {
+        name: name.into(),
+        value,
+        change: if creation { ChangeType::Creation } else { ChangeType::Update }.into(),
+    }
 }
 
-fn protocol_changes(
-    params: String,
-    block: eth::v2::Block,
-    components: BlockTransactionProtocolComponents,
-    balances: StoreDeltas,
-    deltas: BlockBalanceDeltas,
-) -> Result<BlockChanges> {
-    let config = Config::parse(&params)?;
-    let slots = config.slots();
-    let mut changes: BTreeMap<u64, TransactionChangesBuilder> = BTreeMap::new();
-    for creation in components.tx_components {
-        let tx = creation
-            .tx
-            .ok_or_else(|| anyhow::anyhow!("missing creation transaction"))?;
-        let builder = changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(&tx));
-        for component in creation.components {
-            builder.add_protocol_component(&component);
-            // start_block is the entrypoint's deployment block, before CurveBook v3
-            // and custody storage exist. Subsequent writes replace these zero words.
-            let mut attributes: Vec<_> = (0..32)
-                .map(|i| creation_attribute(&format!("word_{i}"), vec![0; 32]))
-                .collect();
-            attributes.push(creation_attribute("balance_owner", config.custodian.to_vec()));
-            attributes.push(creation_attribute("fees_indexed", vec![1]));
-            builder.add_entity_change(&EntityChanges { component_id: component.id, attributes });
-        }
-    }
-    for tx in block.transactions() {
-        if block.number > VALIDATED_BLOCK && has_upgrade(&config, tx) {
-            changes
-                .entry(tx.index.into())
-                .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
-                .change_component_pause_state(&config.id(), true);
-        }
-        let mut attrs = storage_attributes(&config, tx, &slots);
-        attrs.extend(fee_attributes(&config, tx));
-        if !attrs.is_empty() {
-            changes
-                .entry(tx.index.into())
-                .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
-                .add_entity_change(&EntityChanges { component_id: config.id(), attributes: attrs });
-        }
-    }
-    for (_, (tx, balances)) in aggregate_balances_changes(balances, deltas) {
-        let builder = changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(&tx));
-        for tokens in balances.into_values() {
-            for balance in tokens.into_values() {
-                builder.add_balance_change(&balance);
-            }
-        }
-    }
-    Ok(BlockChanges {
-        block: Some((&block).into()),
-        changes: changes
-            .into_values()
-            .filter_map(TransactionChangesBuilder::build)
-            .collect(),
-        storage_changes: vec![],
-    })
-}
-
-/// All three dependencies are UUPS proxies. An upgrade may change storage, pricing,
-/// or immutable custody wiring; pause until the integration is reviewed and reindexed.
-fn has_upgrade(config: &Config, tx: &eth::v2::TransactionTrace) -> bool {
-    tx.logs_with_calls().any(|(log, _)| {
-        [config.entrypoint, config.curve_book, config.custodian]
-            .iter()
-            .any(|address| log.address == address.as_slice()) &&
-            log.topics
-                .first()
-                .is_some_and(|topic| topic == UPGRADED.as_slice())
-    })
-}
-
-/// Calls are nested trace order; their writes must be ordered by execution ordinal.
-fn storage_attributes(
+fn snapshot(
     config: &Config,
-    tx: &eth::v2::TransactionTrace,
-    slots: &[(Address, B256)],
+    base: Address,
+    ordinal: u64,
+    state: ReadStore<'_>,
+    keys: ReadStore<'_>,
 ) -> Vec<Attribute> {
-    let mut latest = HashMap::new();
-    for call in tx
-        .calls
-        .iter()
-        .filter(|call| !call.state_reverted)
-    {
-        for write in &call.storage_changes {
-            if write.address != config.curve_book.as_slice() &&
-                write.address != config.custodian.as_slice()
-            {
-                continue;
-            }
-            if let Some(index) = slots
-                .iter()
-                .position(|(address, slot)| {
-                    write.address == address.as_slice() && write.key == slot.as_slice()
-                })
-            {
-                let entry = latest.entry(index).or_insert(write);
-                if write.ordinal > entry.ordinal {
-                    *entry = write;
-                }
-            }
+    let mut attrs: Vec<_> = config
+        .slots(base)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (address, slot))| {
+            attribute(
+                &format!("word_{i}"),
+                state(ordinal, &word_key(address, slot)).unwrap_or_else(|| vec![0; 32]),
+                true,
+            )
+        })
+        .collect();
+    attrs.push(attribute("balance_owner", config.custodian.to_vec(), true));
+    for fee_base in [base, Address::ZERO] {
+        for taker in addresses(keys, ordinal, &format!("fees:{fee_base:x}")) {
+            let value = state(ordinal, &format!("fee:{fee_base:x}:{taker:x}")).unwrap();
+            attrs.push(attribute(
+                &format!("{}_fee_{taker:x}", if fee_base.is_zero() { "taker" } else { "pair" }),
+                value,
+                true,
+            ));
         }
     }
-    let mut attrs: Vec<_> = latest
-        .into_iter()
-        .map(|(i, write)| attribute(&format!("word_{i}"), write.new_value.clone()))
-        .collect();
-    attrs.sort_by(|a, b| a.name.cmp(&b.name));
     attrs
 }
 
-/// Fee events are emitted by the proxy, including during delegatecall. Only the final
-/// value per transaction matters; clearing an override retains an explicit unconfigured value.
-fn fee_attributes(config: &Config, tx: &eth::v2::TransactionTrace) -> Vec<Attribute> {
-    if !tx
-        .calls
-        .iter()
-        .any(|call| !call.state_reverted && call.address == config.entrypoint.as_slice())
-    {
-        return vec![];
-    }
-    let mut latest = BTreeMap::new();
-    for (log, _) in tx
-        .logs_with_calls()
-        .filter(|(log, _)| log.address == config.entrypoint.as_slice())
-    {
-        let Some(topic) = log.topics.first() else { continue };
-        if topic != TAKER_FEE_SET.as_slice() && topic != TAKER_FEE_CLEARED.as_slice() {
-            continue;
-        }
-        let base = Address::from_slice(&log.topics[2][12..]);
-        if base != config.base && !base.is_zero() {
-            continue;
-        }
-        let configured = topic == TAKER_FEE_SET.as_slice();
-        let bps = if configured { U256::from_be_slice(&log.data) } else { U256::ZERO };
-        // A pair override takes precedence over the taker-wide (base zero) fee.
-        // Configured zero is distinct from clearing an override.
-        let name = format!(
-            "{}_fee_{:x}",
-            if base.is_zero() { "taker" } else { "pair" },
-            Address::from_slice(&log.topics[1][12..])
-        );
-        let value = vec![u8::from(configured), (bps.to::<u16>() >> 8) as u8, bps.to::<u16>() as u8];
-        let entry = latest
-            .entry(name)
-            .or_insert((0, vec![]));
-        if log.ordinal >= entry.0 {
-            *entry = (log.ordinal, value);
-        }
-    }
-    latest
-        .into_iter()
-        .map(|(name, (_, value))| attribute(&name, value))
-        .collect()
-}
-
-fn creation_attribute(name: &str, value: Vec<u8>) -> Attribute {
-    Attribute { name: name.into(), value, change: ChangeType::Creation.into() }
-}
-
-fn attribute(name: &str, value: Vec<u8>) -> Attribute {
-    Attribute { name: name.into(), value, change: ChangeType::Update.into() }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::{address, B256};
-    use eth::v2::{Call, StorageChange, TransactionTrace};
-
-    const PARAMS: &str = "entrypoint=0x98c1d9e102eb2806d902b13186bdc7892ac4ffba&curve_book=0x604d9b9eb1e1571c78661a6c1088427ec9c8c6e5&custodian=0xaac48feb93c5c97e0fb3c7c57e1633922a4acda3&base=0x4200000000000000000000000000000000000006&quote=0x833589fcd6edb6e08f4c7c32d4f71b54bda02913&start_block=50895895";
-
-    #[test]
-    fn sdk_balance_aggregation_preserves_component_and_token_identity() {
-        use substreams::pb::substreams::StoreDelta;
-        let config: Config = serde_qs::from_str(PARAMS).unwrap();
-        let id = config.id();
-        let tx = Transaction { hash: vec![1; 32], ..Default::default() };
-        let deltas = BlockBalanceDeltas {
-            balance_deltas: vec![BalanceDelta {
-                ord: 1,
-                tx: Some(tx),
-                token: config.base.to_vec(),
-                delta: vec![7],
-                component_id: id.clone().into_bytes(),
-            }],
-        };
-        let stores = StoreDeltas {
-            deltas: vec![StoreDelta {
-                ordinal: 1,
-                key: format!(
-                    "{}:{}",
-                    id,
-                    config
-                        .base
-                        .to_string()
-                        .trim_start_matches("0x")
-                        .to_lowercase()
-                ),
-                new_value: b"7".to_vec(),
-                ..Default::default()
-            }],
-        };
-        let aggregated = aggregate_balances_changes(stores, deltas);
-        let (_, balances) = aggregated.values().next().unwrap();
-        let balance = &balances[id.as_bytes()][config.base.as_slice()];
-        assert_eq!(balance.balance, vec![7]);
-        assert_eq!(balance.component_id, id.into_bytes());
-        assert_eq!(balance.token, config.base.to_vec());
-    }
-
-    #[test]
-    fn tracks_custody_transfers_in_ordinal_order_without_counting_self_transfers() {
-        use alloy_primitives::{keccak256, Address, U256};
-        use eth::v2::{Block, Log};
-        let config = Config::parse(PARAMS).unwrap();
-        let outside = Address::repeat_byte(1);
-        let log = |from: Address, to: Address, amount: u64, ordinal| Log {
-            address: config.base.to_vec(),
-            topics: vec![
-                keccak256("Transfer(address,address,uint256)").to_vec(),
-                from.into_word().to_vec(),
-                to.into_word().to_vec(),
-            ],
-            data: U256::from(amount)
-                .to_be_bytes::<32>()
-                .to_vec(),
-            ordinal,
-            ..Default::default()
-        };
-        let tx = TransactionTrace {
-            status: 1,
-            calls: vec![Call {
-                logs: vec![
-                    log(outside, config.custodian, 7, 2),
-                    log(config.custodian, outside, 5, 1),
-                    log(config.custodian, config.custodian, 100, 3),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let block = Block {
-            number: config.start_block + 1,
-            transaction_traces: vec![tx],
-            ..Default::default()
-        };
-        let deltas = relative_balances(&config, &block)
-            .unwrap()
-            .balance_deltas;
-        assert_eq!(deltas.len(), 4);
-        assert_eq!(deltas[0].ord, 1);
-        assert_eq!(BigInt::from_signed_bytes_be(&deltas[0].delta), BigInt::from(-5));
-        assert_eq!(
-            BigInt::from_signed_bytes_be(&deltas[2].delta) +
-                BigInt::from_signed_bytes_be(&deltas[3].delta),
-            BigInt::zero()
-        );
-        assert_eq!(deltas[1].ord, 2);
-        assert_eq!(BigInt::from_signed_bytes_be(&deltas[1].delta), BigInt::from(7));
-    }
-
-    #[test]
-    fn weth_wraps_and_unwraps_change_custody_balance() {
-        use alloy_primitives::{keccak256, U256};
-        use eth::v2::{Block, Log};
-        let config = Config::parse(PARAMS).unwrap();
-        let log = |event: &str, amount: u64, ordinal| Log {
-            address: config.base.to_vec(),
-            topics: vec![keccak256(event).to_vec(), config.custodian.into_word().to_vec()],
-            data: U256::from(amount)
-                .to_be_bytes::<32>()
-                .to_vec(),
-            ordinal,
-            ..Default::default()
-        };
-        let block = Block {
-            number: config.start_block + 1,
-            transaction_traces: vec![TransactionTrace {
-                status: 1,
-                calls: vec![
-                    Call {
-                        logs: vec![
-                            log("Deposit(address,uint256)", 9, 1),
-                            log("Withdrawal(address,uint256)", 4, 2),
-                        ],
-                        ..Default::default()
-                    },
-                    Call {
-                        logs: vec![log("Deposit(address,uint256)", 100, 3)],
-                        state_reverted: true,
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let deltas = relative_balances(&config, &block)
-            .unwrap()
-            .balance_deltas;
-        assert_eq!(deltas.len(), 2);
-        assert_eq!(BigInt::from_signed_bytes_be(&deltas[0].delta), BigInt::from(9));
-        assert_eq!(BigInt::from_signed_bytes_be(&deltas[1].delta), BigInt::from(-4));
-        assert!(deltas
-            .iter()
-            .all(|delta| delta.component_id == config.id().as_bytes()));
-    }
-
-    #[test]
-    fn fee_events_keep_explicit_zero_and_clear_in_execution_order() {
-        use alloy_primitives::{keccak256, Address, U256};
-        use eth::v2::Log;
-        let config = Config::parse(PARAMS).unwrap();
-        let router = Address::repeat_byte(1);
-        let log = |base: Address, bps: Option<u16>, ordinal| Log {
-            address: config.entrypoint.to_vec(),
-            topics: vec![
-                keccak256(if bps.is_some() {
-                    "TakerFeeSet(address,address,uint16)"
-                } else {
-                    "TakerFeeCleared(address,address)"
-                })
-                .to_vec(),
-                router.into_word().to_vec(),
-                base.into_word().to_vec(),
-            ],
-            data: bps.map_or(vec![], |value| {
-                U256::from(value)
-                    .to_be_bytes::<32>()
-                    .to_vec()
-            }),
-            ordinal,
-            ..Default::default()
-        };
-        let tx = TransactionTrace {
-            calls: vec![
-                Call {
-                    address: config.entrypoint.to_vec(),
-                    logs: vec![log(config.base, Some(0), 20), log(Address::ZERO, None, 30)],
-                    ..Default::default()
-                },
-                Call {
-                    address: config.entrypoint.to_vec(),
-                    logs: vec![
-                        log(config.base, Some(10), 10),
-                        log(Address::ZERO, Some(20), 15),
-                        log(Address::repeat_byte(2), Some(100), 16),
-                        log(config.base, Some(2000), 5),
-                    ],
-                    ..Default::default()
-                },
-                Call {
-                    address: config.entrypoint.to_vec(),
-                    logs: vec![log(config.base, Some(100), 40)],
-                    state_reverted: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let attrs: HashMap<_, _> = fee_attributes(&config, &tx)
+fn protocol_changes(
+    config: &Config,
+    block: &Block,
+    changes: StoreDeltas,
+    balance_changes: StoreDeltas,
+    state: ReadStore<'_>,
+    keys: ReadStore<'_>,
+    balances: ReadStore<'_>,
+) -> Result<BlockChanges> {
+    let bases = addresses(keys, u64::MAX, "pairs");
+    let mut slots: HashMap<String, Vec<(Address, usize)>> = HashMap::new();
+    for &base in &bases {
+        for (i, (address, slot)) in config
+            .slots(base)
             .into_iter()
-            .map(|attr| (attr.name, attr.value))
-            .collect();
-        assert_eq!(attrs.len(), 2);
-        assert_eq!(attrs[&format!("pair_fee_{router:x}")], vec![1, 0, 0]);
-        assert_eq!(attrs[&format!("taker_fee_{router:x}")], vec![0, 0, 0]);
-        let tx = TransactionTrace {
-            calls: vec![Call {
-                address: config.entrypoint.to_vec(),
-                logs: vec![log(config.base, Some(2000), 1)],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert_eq!(fee_attributes(&config, &tx)[0].value, vec![1, 7, 208]);
+            .enumerate()
+        {
+            slots
+                .entry(word_key(address, slot))
+                .or_default()
+                .push((base, i));
+        }
     }
-
-    #[test]
-    fn dependency_upgrades_pause_routing_after_the_validated_history() {
-        use eth::v2::{Block, BlockHeader, Log};
-        let config = Config::parse(PARAMS).unwrap();
-        for dependency in [config.entrypoint, config.curve_book, config.custodian, Address::ZERO] {
-            for (number, reverted, paused) in [
-                (VALIDATED_BLOCK, false, false),
-                (VALIDATED_BLOCK + 1, false, dependency != Address::ZERO),
-                (VALIDATED_BLOCK + 1, true, false),
-            ] {
-                let block = Block {
-                    number,
-                    header: Some(BlockHeader {
-                        timestamp: Some(Default::default()),
-                        ..Default::default()
-                    }),
-                    transaction_traces: vec![TransactionTrace {
-                        status: 1,
-                        calls: vec![Call {
-                            state_reverted: reverted,
-                            logs: vec![Log {
-                                address: dependency.to_vec(),
-                                topics: vec![
-                                    UPGRADED.to_vec(),
-                                    Address::repeat_byte(1)
-                                        .into_word()
-                                        .to_vec(),
-                                ],
-                                ..Default::default()
-                            }],
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
-                let changes = protocol_changes(
-                    PARAMS.into(),
-                    block,
-                    Default::default(),
-                    Default::default(),
-                    Default::default(),
-                )
-                .unwrap();
-                let attrs: Vec<_> = changes
-                    .changes
+    let mut output = Vec::new();
+    for tx in block.transactions() {
+        let within = |ord| ord >= tx.begin_ordinal && ord <= tx.end_ordinal;
+        let deltas: Vec<_> = changes
+            .deltas
+            .iter()
+            .filter(|d| within(d.ordinal))
+            .collect();
+        let balance_deltas: Vec<_> = balance_changes
+            .deltas
+            .iter()
+            .filter(|d| within(d.ordinal))
+            .collect();
+        if deltas.is_empty() && balance_deltas.is_empty() {
+            continue;
+        }
+        let mut builder = TransactionChangesBuilder::new(&tx.into());
+        let mut attrs: BTreeMap<Address, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+        let mut created = BTreeSet::new();
+        let mut paused = false;
+        for delta in deltas {
+            if let Some(base) = delta.key.strip_prefix("pair:") {
+                if delta.operation == Operation::Create as i32 {
+                    created.insert(base.parse::<Address>()?);
+                }
+            } else if delta.key == "paused" {
+                paused = true;
+            } else if let Some(fee) = delta.key.strip_prefix("fee:") {
+                let (base, taker) = fee.split_once(':').unwrap();
+                let base: Address = base.parse()?;
+                for &target in bases
                     .iter()
-                    .flat_map(|tx| &tx.entity_changes)
-                    .flat_map(|entity| &entity.attributes)
-                    .collect();
-                assert_eq!(attrs.len(), usize::from(paused));
-                if paused {
-                    assert_eq!(attrs[0].name, "paused");
-                    assert_eq!(attrs[0].value, vec![1]);
-                    assert_eq!(attrs[0].change, ChangeType::Creation as i32);
+                    .filter(|b| base.is_zero() || **b == base)
+                {
+                    attrs.entry(target).or_default().insert(
+                        format!("{}_fee_{taker}", if base.is_zero() { "taker" } else { "pair" }),
+                        delta.new_value.clone(),
+                    );
+                }
+            } else if let Some(targets) = slots.get(&delta.key) {
+                for &(base, i) in targets {
+                    attrs
+                        .entry(base)
+                        .or_default()
+                        .insert(format!("word_{i}"), delta.new_value.clone());
                 }
             }
         }
+        for &base in &bases {
+            if state(tx.end_ordinal, &format!("pair:{base:x}")).is_none() {
+                continue;
+            }
+            let id = config.id(base);
+            let creation = created.contains(&base);
+            if creation {
+                builder.add_protocol_component(
+                    &ProtocolComponent::new(&id)
+                        .with_tokens(&[base, config.quote])
+                        .as_swap_type("baibai_pool", ImplementationType::Custom)
+                        .with_attributes(&[
+                            ("base", base.to_vec()),
+                            ("quote", config.quote.to_vec()),
+                            ("custodian", config.custodian.to_vec()),
+                        ]),
+                );
+                builder.add_entity_change(&EntityChanges {
+                    component_id: id.clone(),
+                    attributes: snapshot(config, base, tx.end_ordinal, state, keys),
+                });
+            } else if let Some(values) = attrs.remove(&base) {
+                builder.add_entity_change(&EntityChanges {
+                    component_id: id.clone(),
+                    attributes: values
+                        .into_iter()
+                        .map(|(k, v)| attribute(&k, v, false))
+                        .collect(),
+                });
+            }
+            if paused || (creation && state(tx.end_ordinal, "paused").is_some()) {
+                builder.change_component_pause_state(&id, true);
+            }
+            for token in [base, config.quote] {
+                let key = balance_key(config, token);
+                if creation ||
+                    balance_deltas
+                        .iter()
+                        .any(|d| d.key == key)
+                {
+                    let value = balances(tx.end_ordinal, &key)
+                        .ok_or_else(|| anyhow::anyhow!("missing custody balance for {token}"))?;
+                    let balance: BigInt = String::from_utf8(value)?.parse()?;
+                    anyhow::ensure!(balance >= BigInt::zero(), "negative custody balance");
+                    builder.add_balance_change(&BalanceChange {
+                        token: token.to_vec(),
+                        balance: balance.to_bytes_be().1,
+                        component_id: id.clone().into_bytes(),
+                    });
+                }
+            }
+        }
+        if let Some(change) = builder.build() {
+            output.push(change);
+        }
     }
-
-    #[test]
-    fn chooses_last_execution_write_and_ignores_reverted_calls() {
-        let book = address!("604d9b9eb1e1571c78661a6c1088427ec9c8c6e5");
-        let slot = B256::repeat_byte(1);
-        let write = |ordinal, value| StorageChange {
-            address: book.to_vec(),
-            key: slot.to_vec(),
-            new_value: vec![value],
-            ordinal,
-            ..Default::default()
-        };
-        let tx = TransactionTrace {
-            calls: vec![
-                Call { storage_changes: vec![write(30, 3)], ..Default::default() },
-                Call { storage_changes: vec![write(20, 2)], ..Default::default() },
-                Call {
-                    storage_changes: vec![write(40, 4)],
-                    state_reverted: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let attrs = storage_attributes(&Config::parse(PARAMS).unwrap(), &tx, &[(book, slot)]);
-        assert_eq!(attrs.len(), 1);
-        assert_eq!(attrs[0].name, "word_0");
-        assert_eq!(attrs[0].value, vec![3]);
-        assert!(storage_attributes(&Config::parse(PARAMS).unwrap(), &tx, &[(book, B256::ZERO)])
-            .is_empty());
-    }
+    Ok(BlockChanges { block: Some(block.into()), changes: output, storage_changes: vec![] })
 }
+
+#[substreams::handlers::map]
+pub fn map_protocol_changes(
+    params: String,
+    block: Block,
+    changes: StoreDeltas,
+    balance_changes: StoreDeltas,
+    state: StoreGetRaw,
+    keys: StoreGetRaw,
+    balances: StoreGetRaw,
+) -> Result<BlockChanges> {
+    protocol_changes(
+        &Config::parse(&params)?,
+        &block,
+        changes,
+        balance_changes,
+        &|ord, key| state.get_at(ord, key),
+        &|ord, key| if ord == u64::MAX { keys.get_last(key) } else { keys.get_at(ord, key) },
+        &|ord, key| balances.get_at(ord, key),
+    )
+}
+
+#[cfg(test)]
+mod tests;
