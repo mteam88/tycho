@@ -17,7 +17,7 @@ use tycho_substreams::{
     prelude::*,
 };
 
-const VALIDATED_BLOCK: u64 = 51_191_196;
+const VALIDATED_BLOCK: u64 = 51_696_183;
 const TAKER_FEE_SET: B256 =
     b256!("1f50e1aaaff835659bf08a8d3473edefb7f61e28a27572c62fa8daa40da9e268");
 const TAKER_FEE_CLEARED: B256 =
