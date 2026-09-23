@@ -9,7 +9,7 @@ skip_balance_check: true
 tests:
   - name: curve_book_v3
     start_block: 50895895
-    stop_block: 51191196
+    stop_block: 51696283
     expected_components:
       - id: "0x98c1d9e102eb2806d902b13186bdc7892ac4ffba4200000000000000000000000000000000000006"
         tokens:
