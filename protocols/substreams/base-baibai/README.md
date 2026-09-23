@@ -89,7 +89,7 @@ as though they represented separate inventories.
 
 Rebasing and fee-on-transfer tokens are not supported. The entrypoint, CurveBook
 and custodian are upgradeable proxies. Any `Upgraded` event from these proxies
-after the validated block 51,191,196 marks existing and subsequently discovered
+after the validated block 51,696,183 marks existing and subsequently discovered
 components paused using Tycho's standard pause attribute. Historical upgrades
 through that block are included in replay. Client-side removal of paused components is an upstream `tycho-client` follow-up;
 this adapter emits the standard attribute and does not duplicate that mechanism.

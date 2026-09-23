@@ -344,6 +344,9 @@ fn upgrades_pause_existing_and_later_discovered_pairs() {
         logs: vec![event(config.curve_book, "Upgraded(address)", &[OTHER], 10)],
         ..Default::default()
     }]);
+    let mut validated = tx.clone();
+    validated.number = VALIDATED_BLOCK;
+    assert!(state_changes(&config, &validated).is_empty());
     for (o, k, v) in state_changes(&config, &tx) {
         state.set(o, k, v);
     }
