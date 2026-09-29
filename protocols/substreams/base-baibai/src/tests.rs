@@ -1,5 +1,5 @@
 use super::*;
-use alloy_primitives::address;
+use alloy_primitives::{address, keccak256};
 use substreams::pb::substreams::StoreDelta;
 use substreams_ethereum::pb::eth::v2::{BlockHeader, Call, Log, StorageChange, TransactionTrace};
 
@@ -101,6 +101,7 @@ fn output(
     protocol_changes(
         config,
         block,
+        &addresses(keys.get(u64::MAX, "pairs")),
         state.deltas(),
         balances.deltas(),
         &|o, k| state.get(o, k),
@@ -120,7 +121,11 @@ fn discovery_inherits_prior_fees_claims_and_words_and_repeats_do_not_recreate() 
         state.set(0, word_key(slots[i].0, slots[i].1), vec![value]);
     }
     for (base, value) in [(OTHER, vec![1, 0, 0]), (Address::ZERO, vec![1, 0, 25])] {
-        keys.set(0, format!("fees:{base:x}"), format!("{TAKER:x};").into_bytes());
+        keys.set(
+            0,
+            fees_key(&format!("{base:x}"), &format!("{TAKER:x}")),
+            format!("{TAKER:x};").into_bytes(),
+        );
         state.set(0, format!("fee:{base:x}:{TAKER:x}"), value);
     }
     let tx = block(vec![Call {
@@ -292,8 +297,8 @@ fn events_and_storage_follow_execution_order_and_exclude_reverts() {
 #[test]
 fn bootstrap_reconciles_prelisting_deposits_and_same_block_transfers() {
     let config = Config::parse(PARAMS).unwrap();
-    let (_, mut keys, _) = listed(&config, &[BASE]);
-    keys.set(20, "pairs".into(), format!("{BASE:x};{OTHER:x};").into_bytes());
+    let (mut state, ..) = listed(&config, &[BASE]);
+    state.set(20, format!("pair:{OTHER:x}"), vec![1]);
     let transfer = |from, to, amount, ordinal| {
         let mut log = event(OTHER, "Transfer(address,address,uint256)", &[from, to], ordinal);
         log.data = U256::from(amount)
@@ -309,7 +314,7 @@ fn bootstrap_reconciles_prelisting_deposits_and_same_block_transfers() {
         ],
         ..Default::default()
     }]);
-    let deltas = balance_deltas(&config, &tx, &|o, k| keys.get(o, k), &|token| {
+    let deltas = balance_deltas(&config, &tx, &[BASE, OTHER], &state.deltas(), &|token| {
         assert_eq!(token, OTHER);
         Ok(BigInt::from(52))
     })
@@ -373,7 +378,6 @@ fn upgrades_pause_existing_and_later_discovered_pairs() {
 #[test]
 fn tracks_weth_wraps_and_unwraps_without_rpc_for_known_tokens() {
     let config = Config::parse(PARAMS).unwrap();
-    let (_, keys, _) = listed(&config, &[BASE]);
     let log = |signature, amount, ordinal| {
         let mut log = event(BASE, signature, &[config.custodian], ordinal);
         log.data = U256::from(amount)
@@ -395,7 +399,7 @@ fn tracks_weth_wraps_and_unwraps_without_rpc_for_known_tokens() {
             ..Default::default()
         },
     ]);
-    let deltas = balance_deltas(&config, &tx, &|o, k| keys.get(o, k), &|_| {
+    let deltas = balance_deltas(&config, &tx, &[BASE], &StoreDeltas::default(), &|_| {
         panic!("known token must not bootstrap")
     })
     .unwrap()
