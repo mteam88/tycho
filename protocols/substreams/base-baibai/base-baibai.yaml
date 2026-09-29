@@ -37,6 +37,8 @@ modules:
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
+      - store: store_state
+        mode: deltas
       - store: store_keys
         mode: get
     output:
