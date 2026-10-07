@@ -6,6 +6,8 @@ use substreams_ethereum::pb::eth::v2::{BlockHeader, Call, Log, StorageChange, Tr
 const BASE: Address = address!("4200000000000000000000000000000000000006");
 const OTHER: Address = Address::repeat_byte(2);
 const TAKER: Address = Address::repeat_byte(3);
+// A different first byte places this taker in another fee shard.
+const OTHER_TAKER: Address = Address::repeat_byte(0xa7);
 const PARAMS: &str = "entrypoint=0x98c1d9e102eb2806d902b13186bdc7892ac4ffba&curve_book=0x604d9b9eb1e1571c78661a6c1088427ec9c8c6e5&custodian=0xaac48feb93c5c97e0fb3c7c57e1633922a4acda3&quote=0x833589fcd6edb6e08f4c7c32d4f71b54bda02913&start_block=50895895";
 
 // Store reads at transaction boundaries, including pre-existing state at ordinal zero.
@@ -120,13 +122,18 @@ fn discovery_inherits_prior_fees_claims_and_words_and_repeats_do_not_recreate() 
     for (i, value) in [(0, 8), (1, 42), (30, 7), (31, 9)] {
         state.set(0, word_key(slots[i].0, slots[i].1), vec![value]);
     }
-    for (base, value) in [(OTHER, vec![1, 0, 0]), (Address::ZERO, vec![1, 0, 25])] {
+    for (base, taker, value) in [
+        (OTHER, TAKER, vec![1, 0, 0]),
+        (Address::ZERO, TAKER, vec![1, 0, 25]),
+        (OTHER, OTHER_TAKER, vec![1, 0, 7]),
+        (Address::ZERO, OTHER_TAKER, vec![0, 0, 0]),
+    ] {
         keys.set(
             0,
-            fees_key(&format!("{base:x}"), &format!("{TAKER:x}")),
-            format!("{TAKER:x};").into_bytes(),
+            fee_shard_key(&format!("{base:x}"), taker[0]),
+            format!("{taker:x};").into_bytes(),
         );
-        state.set(0, format!("fee:{base:x}:{TAKER:x}"), value);
+        state.set(0, format!("fee:{base:x}:{taker:x}"), value);
     }
     let tx = block(vec![Call {
         logs: vec![event(
@@ -161,6 +168,8 @@ fn discovery_inherits_prior_fees_claims_and_words_and_repeats_do_not_recreate() 
     assert_eq!(attrs["word_31"], vec![9]);
     assert_eq!(attrs[format!("pair_fee_{TAKER:x}").as_str()], vec![1, 0, 0]);
     assert_eq!(attrs[format!("taker_fee_{TAKER:x}").as_str()], vec![1, 0, 25]);
+    assert_eq!(attrs[format!("pair_fee_{OTHER_TAKER:x}").as_str()], vec![1, 0, 7]);
+    assert_eq!(attrs[format!("taker_fee_{OTHER_TAKER:x}").as_str()], vec![0, 0, 0]);
     assert_eq!(change.balance_changes.len(), 2);
     assert!(change
         .balance_changes

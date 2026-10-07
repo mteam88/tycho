@@ -49,8 +49,8 @@ fn addresses(value: Option<Vec<u8>>) -> Vec<Address> {
 }
 
 /// Taker lists are sharded by the taker's first byte to stay under the 8 KB append limit.
-fn fees_key(base: &str, taker: &str) -> String {
-    format!("fees:{base}:{}", &taker[..2])
+fn fee_shard_key(base: &str, shard: u8) -> String {
+    format!("fees:{base}:{shard:02x}")
 }
 
 /// Bases whose first CurveUpdated falls in this block, with its ordinal.
@@ -153,7 +153,8 @@ pub fn store_keys(changes: StoreDeltas, store: StoreAppend<String>) {
             store.append(delta.ordinal, "pairs", base.to_string());
         } else if let Some(fee) = delta.key.strip_prefix("fee:") {
             let (base, taker) = fee.split_once(':').unwrap();
-            store.append(delta.ordinal, fees_key(base, taker), taker.to_string());
+            let shard = taker.parse::<Address>().unwrap()[0];
+            store.append(delta.ordinal, fee_shard_key(base, shard), taker.to_string());
         }
     }
 }
@@ -275,15 +276,14 @@ fn snapshot(
         .collect();
     attrs.push(attribute("balance_owner", config.custodian.to_vec(), true));
     for fee_base in [base, Address::ZERO] {
-        for taker in (0..=u8::MAX).flat_map(|shard| {
-            addresses(keys(ordinal, &fees_key(&format!("{fee_base:x}"), &format!("{shard:02x}"))))
-        }) {
-            let value = state(ordinal, &format!("fee:{fee_base:x}:{taker:x}")).unwrap();
-            attrs.push(attribute(
-                &format!("{}_fee_{taker:x}", if fee_base.is_zero() { "taker" } else { "pair" }),
-                value,
-                true,
-            ));
+        let base_hex = format!("{fee_base:x}");
+        let kind = if fee_base.is_zero() { "taker" } else { "pair" };
+        for shard in 0..=u8::MAX {
+            for taker in addresses(keys(ordinal, &fee_shard_key(&base_hex, shard))) {
+                let value = state(ordinal, &format!("fee:{base_hex}:{taker:x}"))
+                    .expect("store_keys only lists takers with a fee entry");
+                attrs.push(attribute(&format!("{kind}_fee_{taker:x}"), value, true));
+            }
         }
     }
     attrs
