@@ -31,25 +31,6 @@ pub struct BaibaiState {
 }
 
 impl BaibaiState {
-    /// Copy shared-token custody from a later state in the same simulated route.
-    ///
-    /// Callers must group pools by their `custodian` static attribute and call this after
-    /// each swap before quoting siblings or recomputing their limits. Keep candidate routes'
-    /// states separate: indexed balances and per-pool limits alone do not prevent a split
-    /// route from spending the same custody twice. Pair curves and cursors are unchanged.
-    pub fn sync_custody(&mut self, from: &Self) {
-        for (i, token) in self.tokens.iter().enumerate() {
-            if let Some(j) = from
-                .tokens
-                .iter()
-                .position(|other| other == token)
-            {
-                self.balances[i] = from.balances[j];
-                self.words[30 + i] = from.words[30 + j];
-            }
-        }
-    }
-
     fn fee_bps(&self) -> u16 {
         self.fees[0]
             .or(self.fees[1])

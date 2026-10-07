@@ -376,7 +376,6 @@ fn protocol_changes(
                         .with_attributes(&[
                             ("base", base.to_vec()),
                             ("quote", config.quote.to_vec()),
-                            ("custodian", config.custodian.to_vec()),
                         ]),
                 );
                 builder.add_entity_change(&EntityChanges {

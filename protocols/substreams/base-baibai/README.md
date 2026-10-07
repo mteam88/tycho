@@ -10,8 +10,7 @@ Router-level fees are separate.
 
 The component ID is `0x` followed by the concatenated 20-byte entrypoint and base token
 addresses (lowercase hex). Static `base` and `quote`
-attributes identify token roles independently of token ordering; static `custodian`
-identifies the shared inventory owner.
+attributes identify token roles independently of token ordering.
 
 ## State
 
@@ -80,12 +79,10 @@ without double-counting same-block transfers. Normal updates and quotes use no R
 Changing `start_block` to an arbitrary recent block is not a valid bootstrap.
 Reindex from deployment when changing this unreleased package's module graph.
 
-Routing multiple pairs requires shared custody **within each simulated route**.
-After each swap, call `BaibaiState::sync_custody` on sibling states with the same
-`custodian`, then recompute their limits. Keep each candidate's states separate.
-Pair curves and fill cursors remain independent; balances and claim reservations
-for intersecting tokens are shared. Independent per-pool limits must not be added
-as though they represented separate inventories.
+All pairs draw on one custodian, but each component is simulated independently,
+like other venues whose makers share inventory across pairs. A route through
+several BaiBai pairs can therefore overestimate the shared balance of a common
+token. The worst case is a revert, since the router enforces `minAmountOut`.
 
 Rebasing and fee-on-transfer tokens are not supported. The entrypoint, CurveBook
 and custodian are upgradeable proxies. Any `Upgraded` event from these proxies
