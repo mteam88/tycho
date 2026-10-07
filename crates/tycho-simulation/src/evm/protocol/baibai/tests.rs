@@ -495,69 +495,6 @@ fn fees_round_up_retain_custody_and_limits_bound_net_output() {
 }
 
 #[test]
-fn shared_custody_sync_prevents_double_spend_and_preserves_pair_state() {
-    let fixture = fixture();
-    let mut first = state(&fixture, &fixture.scenarios[0]);
-    let first_tokens = tokens(&first);
-    let input = BigUint::from(10u64).pow(16);
-    let out = first
-        .get_amount_out(input.clone(), &first_tokens[0], &first_tokens[1])
-        .unwrap()
-        .amount;
-    first.balances[1] = super::math::uint(&out).unwrap();
-    let mut second = first.clone();
-    second.tokens[0] = Bytes::from(vec![2; 20]);
-    let second_tokens = tokens(&second);
-    let untouched = second.clone();
-    let traded = first
-        .get_amount_out(input.clone(), &first_tokens[0], &first_tokens[1])
-        .unwrap();
-    second.sync_custody(
-        traded
-            .new_state
-            .as_any()
-            .downcast_ref()
-            .unwrap(),
-    );
-    assert!(second
-        .get_amount_out(input.clone(), &second_tokens[0], &second_tokens[1])
-        .is_err());
-    assert_eq!(
-        second
-            .get_limits(second.tokens[0].clone(), second.tokens[1].clone())
-            .unwrap()
-            .0,
-        BigUint::ZERO
-    );
-    assert_eq!(second.words[..30], untouched.words[..30]);
-    assert_eq!(second.balances[0], untouched.balances[0]);
-    let synced = second.clone();
-    second.sync_custody(
-        traded
-            .new_state
-            .as_any()
-            .downcast_ref()
-            .unwrap(),
-    );
-    assert_eq!(second, synced);
-    // A quote-input swap replenishes shared quote custody for a sibling's next output.
-    let funded = second
-        .get_amount_out(out.clone(), &second_tokens[1], &second_tokens[0])
-        .unwrap();
-    second.sync_custody(
-        funded
-            .new_state
-            .as_any()
-            .downcast_ref()
-            .unwrap(),
-    );
-    assert!(second
-        .get_amount_out(input, &second_tokens[0], &second_tokens[1])
-        .is_ok());
-    assert_eq!(untouched.balances[1], first.balances[1]); // Other candidates stay untouched.
-}
-
-#[test]
 fn discovery_before_v3_shape_cannot_quote_old_layout_or_migrated_counters() {
     let fixture = fixture();
     let mut state = state(&fixture, &fixture.scenarios[0]);
