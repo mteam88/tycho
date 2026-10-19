@@ -17,9 +17,10 @@ use tycho_substreams::{
     prelude::*,
 };
 
-const VALIDATED_BLOCK: u64 = 51_696_183;
-const CURVE_UPDATED: B256 =
-    b256!("9beb28798dcd13ee356d61056b666fd0b145c21c274d8743245ce6d60aa28860");
+const VALIDATED_BLOCK: u64 = 52_815_216;
+/// `PairListed(address indexed base, address indexed quote)`: a base's first SHAPE, or the
+/// one-time `announcePairs` backfill for bases listed before the event existed.
+const PAIR_LISTED: B256 = b256!("e2a6ed7f9feacc393011f0446ea4c4c90193d3ed85b8291168937b9afec690a5");
 const WITHDRAW_SETTLED: B256 =
     b256!("88593277f0d65b0873b93edb43094ab40071e31177f6c8b5487d4edb6217ce13");
 const WITHDRAW_EXECUTED: B256 =
@@ -53,7 +54,7 @@ fn fee_shard_key(base: &str, shard: u8) -> String {
     format!("fees:{base}:{shard:02x}")
 }
 
-/// Bases whose first CurveUpdated falls in this block, with its ordinal.
+/// Bases whose first PairListed falls in this block, with its ordinal.
 fn listings(changes: &StoreDeltas) -> BTreeMap<Address, u64> {
     changes
         .deltas
@@ -80,7 +81,7 @@ fn state_changes(config: &Config, block: &Block) -> Vec<(u64, String, Vec<u8>)> 
         let mut claim_slots = BTreeSet::new();
         for (log, _) in tx.logs_with_calls() {
             let Some(topic) = log.topics.first() else { continue };
-            if log.address == config.curve_book.as_slice() && topic == CURVE_UPDATED.as_slice() {
+            if log.address == config.curve_book.as_slice() && topic == PAIR_LISTED.as_slice() {
                 let base = Address::from_slice(&log.topics[1][12..]);
                 changes.push((log.ordinal, format!("pair:{base:x}"), vec![1]));
             }

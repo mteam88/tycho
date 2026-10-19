@@ -3,7 +3,7 @@ package:
   name: base_baibai
   version: v0.1.0
   url: https://github.com/propeller-heads/tycho/tree/main/protocols/substreams/base-baibai
-  description: BaiBai CurveBook v3 on Base
+  description: BaiBai CurveBook v5 on Base
 protobuf:
   files:
     - tycho/evm/v1/common.proto

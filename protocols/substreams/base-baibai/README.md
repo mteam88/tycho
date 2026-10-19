@@ -1,6 +1,6 @@
 # BaiBai on Base
 
-Discovers base-token pairs from successful `CurveUpdated` events on the configured
+Discovers base-token pairs from successful `PairListed` events on the configured
 BaiBai CurveBook deployment. All pairs share its configured quote token. The native simulator supports
 exact-input swaps in both directions with the executing router's taker fee.
 Set `DecoderContext::caller(router_address)` when registering `BaibaiState` through
@@ -14,9 +14,10 @@ attributes identify token roles independently of token ordering.
 
 ## State
 
-`word_0` is the CurveBook v3 TTL. `word_1` through `word_5` are pair storage
+`word_0` is the CurveBook TTL. `word_1` through `word_5` are pair storage
 slots 0 through 4 (sequences/validity, price/side settings, quantity unit, and
-ask/bid cursors). `word_6` through `word_17` are the twelve packed ask-knot slots;
+ask/bid cursors). Since v5, `word_2`'s high 96 bits hold the priority fee of the
+pair's last update; the curve ignores them. `word_6` through `word_17` are the twelve packed ask-knot slots;
 `word_18` through `word_29` are the bid slots. `word_30` and `word_31` are the
 custodian's total claim reservations for base and quote. Words are unsigned,
 big-endian integers, at most 32 bytes. Component balances are custody holdings;
@@ -53,6 +54,18 @@ revert. Changes to fee semantics or storage layout require an integration update
 Fee history is retained before pair discovery, so new components inherit both
 applicable override levels. No fee-completeness sentinel is required.
 
+### Priority surcharge
+
+Since v5 the entrypoint withholds a further `prioritySurchargeBps` (10 at the
+validated block, at most 10) of gross output, rounded up, from swaps whose priority
+fee (`tx.gasprice - block.basefee`) exceeds the fee of the pair's last curve update.
+It is charged after the taker fee and stays in custody. The simulator prices the
+no-surcharge path: `ProtocolSim` has no input for the executing transaction's
+priority fee, and a gas-free `quoteFor` prices the same path. Swaps tipping at
+most the last update's priority fee (`word_2 >> 160`) execute at the simulated
+price. A higher tip can lose up to the surcharge, and the router's `minAmountOut`
+reverts such a swap instead of filling it short. The surcharge rate is not indexed.
+
 ## Building and running
 
 From `protocols/substreams`:
@@ -67,8 +80,11 @@ Run with an extended-block Base Substreams endpoint (storage changes are require
 Replay from the manifest's initial block. It is the entrypoint deployment block,
 before custody and CurveBook storage exist. Storage starts at zero and is followed
 through subsequent deployments and updates. Pairs are created on their first
-successful curve publication, irrespective of sequence number or current depth.
-An uninitialized v3 curve remains unquotable until a v3 SHAPE initializes it.
+`PairListed`: a base's first SHAPE, or the one-time `announcePairs` backfill for
+bases listed before the event existed (WETH, block 51,696,183). Discovery is one
+event signature over the whole indexed range, so the v5 change to `CurveUpdated`
+needs no block-gated decoding. Words written before discovery are replayed from
+deployment, so the backfilled WETH component starts with its existing curve.
 
 Custody is stored once per token and fanned out to every pair using that token;
 TTL, quote reservations and taker-wide fees likewise update every affected pair.
@@ -86,7 +102,7 @@ token. The worst case is a revert, since the router enforces `minAmountOut`.
 
 Rebasing and fee-on-transfer tokens are not supported. The entrypoint, CurveBook
 and custodian are upgradeable proxies. Any `Upgraded` event from these proxies
-after the validated block 51,696,183 marks existing and subsequently discovered
+after the validated block 52,815,216 (the v5 upgrade) marks existing and subsequently discovered
 components paused using Tycho's standard pause attribute. Historical upgrades
 through that block are included in replay. Client-side removal of paused components is an upstream `tycho-client` follow-up;
 this adapter emits the standard attribute and does not duplicate that mechanism.

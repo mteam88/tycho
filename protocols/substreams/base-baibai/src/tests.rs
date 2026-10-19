@@ -136,15 +136,28 @@ fn discovery_inherits_prior_fees_claims_and_words_and_repeats_do_not_recreate() 
         state.set(0, format!("fee:{base:x}:{taker:x}"), value);
     }
     let tx = block(vec![Call {
-        logs: vec![event(
-            config.curve_book,
-            "CurveUpdated(address,uint64,uint64,bytes32)",
-            &[OTHER],
-            20,
-        )],
+        logs: vec![
+            event(config.curve_book, "PairListed(address,address)", &[OTHER, config.quote], 20),
+            // Updates never list a pair; only the book's listing event does.
+            event(
+                config.curve_book,
+                "CurveUpdated(address,uint64,uint64,uint64,bytes32)",
+                &[TAKER],
+                21,
+            ),
+        ],
         ..Default::default()
     }]);
-    for (o, k, v) in state_changes(&config, &tx) {
+    let discovered = state_changes(&config, &tx);
+    assert_eq!(
+        discovered
+            .iter()
+            .filter(|c| c.1.starts_with("pair:"))
+            .map(|c| c.1.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("pair:{OTHER:x}")]
+    );
+    for (o, k, v) in discovered {
         state.set(o, k, v);
     }
     keys.set(20, "pairs".into(), format!("{BASE:x};{OTHER:x};").into_bytes());
@@ -275,12 +288,7 @@ fn events_and_storage_follow_execution_order_and_exclude_reverts() {
         Call {
             logs: vec![
                 fee(Some(90), 40),
-                event(
-                    config.curve_book,
-                    "CurveUpdated(address,uint64,uint64,bytes32)",
-                    &[OTHER],
-                    41,
-                ),
+                event(config.curve_book, "PairListed(address,address)", &[OTHER, config.quote], 41),
             ],
             storage_changes: vec![write(39, 99)],
             state_reverted: true,
