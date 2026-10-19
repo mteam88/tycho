@@ -1,4 +1,4 @@
-//! Integer arithmetic for CurveBook v3. Quantities and costs are token atomic units.
+//! Integer arithmetic for the BaiBai CurveBook. Quantities and costs are token atomic units.
 use alloy::primitives::{U256, U512};
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;

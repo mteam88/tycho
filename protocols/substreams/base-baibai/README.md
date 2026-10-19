@@ -56,15 +56,18 @@ applicable override levels. No fee-completeness sentinel is required.
 
 ### Priority surcharge
 
-Since v5 the entrypoint withholds a further `prioritySurchargeBps` (10 at the
-validated block, at most 10) of gross output, rounded up, from swaps whose priority
+Since v5 the entrypoint withholds a further `prioritySurchargeBps` (10 since
+block 52,815,342, at most 10) of gross output, rounded up, from swaps whose priority
 fee (`tx.gasprice - block.basefee`) exceeds the fee of the pair's last curve update.
 It is charged after the taker fee and stays in custody. The simulator prices the
 no-surcharge path: `ProtocolSim` has no input for the executing transaction's
 priority fee, and a gas-free `quoteFor` prices the same path. Swaps tipping at
 most the last update's priority fee (`word_2 >> 160`) execute at the simulated
 price. A higher tip can lose up to the surcharge, and the router's `minAmountOut`
-reverts such a swap instead of filling it short. The surcharge rate is not indexed.
+reverts such a swap instead of filling it short. The maker's update tip is small
+(16,000,000 wei, 0.016 gwei, at block 52,828,141), so a solver tipping above it
+should expect to receive 10 bps less than simulated. The surcharge rate is not
+indexed.
 
 ## Building and running
 
