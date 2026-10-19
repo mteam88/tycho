@@ -1,4 +1,4 @@
-//! BaiBai CurveBook v3: exact-input simulation for zero-fee takers.
+//! BaiBai CurveBook (v5): exact-input simulation of the entrypoint's no-surcharge path.
 mod decoder;
 mod math;
 mod state;

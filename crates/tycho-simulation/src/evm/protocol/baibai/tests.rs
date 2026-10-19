@@ -13,10 +13,19 @@ use super::{math::big, BaibaiState};
 
 #[derive(serde::Deserialize)]
 struct Fixture {
+    block: u64,
     timestamp: u64,
     base: Bytes,
     quote: Bytes,
     scenarios: Vec<Scenario>,
+    live: Live,
+}
+/// The pinned block's unmodified state and the entrypoint's quotes for the Tycho router.
+#[derive(serde::Deserialize)]
+struct Live {
+    words: [U256; 32],
+    balances: [String; 2],
+    cases: Vec<Case>,
 }
 #[derive(serde::Deserialize)]
 struct Scenario {
@@ -34,7 +43,7 @@ struct Case {
 fn fixture() -> Fixture {
     serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/assets/baibai-quotes.json"
+        "/tests/assets/baibai/quotes.json"
     )))
     .unwrap()
 }
@@ -62,8 +71,9 @@ fn tokens(state: &BaibaiState) -> [Token; 2] {
     ]
 }
 
-/// Expected values come from eth_call against deployed CurveBook v3 bytecode at
-/// the fixture's pinned block, with only the listed curve storage overridden.
+/// Expected values come from eth_call against the deployed CurveBook (v5) at the fixture's
+/// pinned block, with only the listed curve storage overridden. Regenerate with
+/// `tests/assets/baibai/fetch_quotes.py`.
 #[test]
 fn quotes_match_deployed_bytecode() {
     let fixture = fixture();
@@ -100,6 +110,38 @@ fn quotes_match_deployed_bytecode() {
             }
         }
     }
+}
+
+/// The block's real state, as indexed, quotes exactly what `Entrypoint.quoteFor` returns for the
+/// Tycho router: the production entrypoint, live fee configuration and custody, both directions.
+#[test]
+fn live_state_matches_entrypoint_quote_for() {
+    let fixture = fixture();
+    let mut state = state(&fixture, &fixture.scenarios[0]);
+    state.words = fixture.live.words;
+    state.balances = fixture
+        .live
+        .balances
+        .each_ref()
+        .map(|b| U256::from_str(b).unwrap());
+    assert!(state.fresh(), "live curve at block {} must be fresh", fixture.block);
+    let tokens = tokens(&state);
+    let mut quoted = 0;
+    for case in &fixture.live.cases {
+        let input = BigUint::from_str(&case.input).unwrap();
+        let expected = BigUint::from_str(&case.output).unwrap();
+        let direction = usize::from(!case.sell_base);
+        let actual =
+            state.get_amount_out(input.clone(), &tokens[direction], &tokens[1 - direction]);
+        if expected == BigUint::ZERO {
+            assert!(actual.is_err(), "{direction} {input}");
+        } else {
+            let actual = actual.unwrap_or_else(|e| panic!("{direction} {input}: {e}"));
+            assert_eq!(actual.amount, expected, "{direction} {input}");
+            quoted += 1;
+        }
+    }
+    assert!(quoted >= 10);
 }
 
 #[test]
