@@ -79,7 +79,7 @@ abstract contract RuntimeBytecodeFixtures is CommonBase, StdCheats {
         // Listed by fixture name.
         // BaiBai's constructor reads quoteToken() from its entrypoint, deployed after the pinned
         // Base block.
-        _executor("Baibai", "base", "baibai", 51_696_183);
+        _executor("Baibai", "base", "baibai", 52_828_141);
         _executor("BalancerV2", "ethereum", "vm:balancer_v2");
         _executor("BalancerV3", "ethereum", "vm:balancer_v3");
         _executor("Curve", "ethereum", "vm:curve");

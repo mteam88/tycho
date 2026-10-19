@@ -15,12 +15,18 @@ interface IBaibaiFees {
         uint256 amountIn,
         address taker
     ) external view returns (uint256 amountOut, uint256 fee);
+    function prioritySurchargeBps() external view returns (uint16);
+}
+
+interface IBaibaiCurveBook {
+    function updatePriorityFee(address base) external view returns (uint96);
 }
 
 contract BaibaiTest is TychoRouterTestSetup {
     BaibaiExecutor public baibaiExecutor;
     address internal constant BAIBAI_ENTRYPOINT =
         0x98c1D9E102Eb2806D902b13186BDc7892aC4fFBa;
+    address constant CURVE_BOOK = 0x604d9b9eB1e1571C78661a6C1088427EC9c8c6E5;
     address constant CUSTODIAN = 0xAaC48FEB93c5C97E0fb3c7C57E1633922A4ACDa3;
     address constant BASE = 0x4200000000000000000000000000000000000006;
     address constant QUOTE = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -42,7 +48,8 @@ contract BaibaiTest is TychoRouterTestSetup {
     }
 
     function getForkBlock() public pure override returns (uint256) {
-        return 51191196;
+        // After the v5 upgrade (52815216) and its priority surcharge (52815342).
+        return 52828141;
     }
 
     /// @dev Output token and debit destination are derived for both swap directions.
@@ -89,7 +96,10 @@ contract BaibaiTest is TychoRouterTestSetup {
         IBaibaiFees(BAIBAI_ENTRYPOINT).setTakerFee(taker, BASE, bps);
     }
 
-    function _swap(bool sellBase, uint256 amount) internal {
+    function _swap(bool sellBase, uint256 amount)
+        internal
+        returns (uint256 received)
+    {
         address input = sellBase ? BASE : QUOTE;
         address output = sellBase ? QUOTE : BASE;
         (uint256 expected,) = IBaibaiFees(BAIBAI_ENTRYPOINT)
@@ -105,7 +115,7 @@ contract BaibaiTest is TychoRouterTestSetup {
         );
         (bool success, bytes memory result) = tychoRouterAddr.call(callData);
         assertTrue(success, "Rust-encoded BaiBai swap failed");
-        uint256 received = abi.decode(result, (uint256));
+        received = abi.decode(result, (uint256));
         vm.stopPrank();
         assertEq(received, expected);
         assertEq(IERC20(output).balanceOf(BOB) - beforeBalance, expected);
@@ -136,6 +146,49 @@ contract BaibaiTest is TychoRouterTestSetup {
             .quoteFor(BASE, BASE, 1e16, tychoRouterAddr);
         _setFee(tychoRouterAddr, 25);
         _assertSellReverts(beforeFee);
+    }
+
+    /// @dev Only a swap that out-tips the pair's last curve update pays the priority surcharge.
+    ///      Tipping at most that fee executes at the gas-free quote the simulator reproduces.
+    function testPrioritySurchargeOnlyForOutTippingSwaps() public {
+        uint256 updateTip = IBaibaiCurveBook(CURVE_BOOK).updatePriorityFee(BASE);
+        uint256 bps = IBaibaiFees(BAIBAI_ENTRYPOINT).prioritySurchargeBps();
+        assertGt(updateTip, 0);
+        assertGt(bps, 0);
+        for (uint8 sell; sell < 2; ++sell) {
+            bool sellBase = sell == 1;
+            uint256 amount = sellBase ? 1e16 : 10e6;
+            // revertToState keeps the transaction's gas price, so reset it to a zero tip.
+            vm.txGasPrice(block.basefee);
+            address output = sellBase ? QUOTE : BASE;
+            (uint256 gasFree, uint256 fee) = IBaibaiFees(BAIBAI_ENTRYPOINT)
+                .quoteFor(
+                    BASE, sellBase ? BASE : QUOTE, amount, tychoRouterAddr
+                );
+            assertEq(fee, 0);
+            uint256 surcharged = gasFree - (gasFree * bps + 9_999) / 10_000;
+            assertLt(surcharged, gasFree);
+
+            uint256 snapshot = vm.snapshotState();
+            vm.txGasPrice(block.basefee + updateTip);
+            assertEq(_swap(sellBase, amount), gasFree);
+            vm.revertToState(snapshot);
+
+            vm.txGasPrice(block.basefee + updateTip + 1);
+            uint256 custodyBefore = IERC20(output).balanceOf(CUSTODIAN);
+            assertEq(_swap(sellBase, amount), surcharged);
+            // The surcharge stays in custody.
+            assertEq(
+                custodyBefore - IERC20(output).balanceOf(CUSTODIAN), surcharged
+            );
+            vm.revertToState(snapshot);
+        }
+        // A route quoted at the gas-free price reverts instead of filling short.
+        vm.txGasPrice(block.basefee);
+        (uint256 sellQuote,) = IBaibaiFees(BAIBAI_ENTRYPOINT)
+            .quoteFor(BASE, BASE, 1e16, tychoRouterAddr);
+        vm.txGasPrice(block.basefee + updateTip + 1);
+        _assertSellReverts(sellQuote);
     }
 
     /// @dev Expiry reverts before any custody balance or router approval persists.
